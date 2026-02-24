@@ -1,0 +1,2054 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CLI Proxy 状态监控</title>
+    <!-- Element Plus CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/element-plus@2.8.0/dist/index.css">
+    <!-- 自定义样式 -->
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div id="app" v-cloak>
+        <div class="container">
+            <header>
+                <h1>CLI Proxy 状态监控</h1>
+                <div class="refresh-info">
+                    <span>{{ lastUpdate }}</span>
+                    <el-button type="primary" @click="refreshData" :loading="loading" size="small">
+                        刷新
+                    </el-button>
+                </div>
+            </header>
+
+            <main>
+                <!-- 服务状态卡片 -->
+                <section class="services-section">
+                    <h2>代理服务状态</h2>
+                    <div class="services-grid">
+                        <div class="service-card">
+                            <h3>Claude 服务</h3>
+                            <div class="status-indicator">
+                                <span :class="['status-dot', services.claude.running ? 'running' : 'stopped']"></span>
+                                <span class="status-text">{{ services.claude.running ? '运行中' : '已停止' }}</span>
+                            </div>
+                            <div class="service-info">
+                                <p><strong>PID:</strong> <span>{{ services.claude.pid || '-' }}</span></p>
+                                <p><strong>端口:</strong> 3210</p>
+                                <p><strong>转发目标:</strong> 
+                                    <el-select 
+                                        v-model="services.claude.config" 
+                                        placeholder="选择配置..."
+                                        @change="switchConfig('claude', $event)"
+                                        size="small"
+                                        style="width: 150px;"
+                                        :disabled="isLoadbalanceWeightMode">
+                                        <el-option 
+                                            v-for="config in claudeConfigs" 
+                                            :key="config" 
+                                            :label="config" 
+                                            :value="config">
+                                        </el-option>
+                                    </el-select>
+                                </p>
+                                <p v-if="isLoadbalanceWeightMode" class="loadbalance-hint">
+                                    <i class="el-icon-warning-outline"></i>
+                                    <span>{{ loadbalanceDisabledNotice }}</span>
+                                </p>
+                            </div>
+                        </div>
+
+                        <div class="service-card">
+                            <h3>Codex 服务</h3>
+                            <div class="status-indicator">
+                                <span :class="['status-dot', services.codex.running ? 'running' : 'stopped']"></span>
+                                <span class="status-text">{{ services.codex.running ? '运行中' : '已停止' }}</span>
+                            </div>
+                            <div class="service-info">
+                                <p><strong>PID:</strong> <span>{{ services.codex.pid || '-' }}</span></p>
+                                <p><strong>端口:</strong> 3211</p>
+                                <p><strong>转发目标:</strong> 
+                                    <el-select 
+                                        v-model="services.codex.config" 
+                                        placeholder="选择配置..."
+                                        @change="switchConfig('codex', $event)"
+                                        size="small"
+                                        style="width: 150px;"
+                                        :disabled="isLoadbalanceWeightMode">
+                                        <el-option 
+                                            v-for="config in codexConfigs" 
+                                            :key="config" 
+                                            :label="config" 
+                                            :value="config">
+                                        </el-option>
+                                    </el-select>
+                                </p>
+                                <p v-if="isLoadbalanceWeightMode" class="loadbalance-hint">
+                                    <i class="el-icon-warning-outline"></i>
+                                    <span>{{ loadbalanceDisabledNotice }}</span>
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 统计信息 -->
+                <section class="stats-section">
+                    <h2>系统统计</h2>
+                    <div class="stats-grid">
+                        <div class="stat-card clickable" @click="viewAllLogs">
+                            <h4>总请求数</h4>
+                            <div class="stat-value">{{ stats.requestCount || 0 }}</div>
+                            <div class="stat-hint">点击查看请求日志</div>
+                        </div>
+                        <div class="stat-card clickable" @click="openConfigDrawer">
+                            <h4>配置数量</h4>
+                            <div class="stat-value">{{ stats.configCount || 0 }}</div>
+                            <div class="stat-hint">点击编辑配置</div>
+                        </div>
+                        <div class="stat-card clickable" @click="openFilterDrawer">
+                            <h4>请求过滤</h4>
+                            <div class="stat-value">{{ stats.filterCount || 0 }}</div>
+                            <div class="stat-hint">点击编辑过滤</div>
+                        </div>
+                        <div class="stat-card clickable usage-card" @click="openUsageDrawer">
+                            <h4>Token 使用</h4>
+                            <div class="stat-value">{{ usageSummary.formattedTotals.total || '0' }}</div>
+                            <div class="stat-hint">点击查看明细</div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 模型路由管理 -->
+                <section class="routing-section">
+                    <h2>模型路由管理</h2>
+                    <div class="routing-grid">
+                        <div class="routing-card" 
+                             :class="{ active: routingMode === 'default' }"
+                             @click="selectRoutingMode('default')">
+                            <div class="routing-card-header">
+                                <i class="el-icon-right"></i>
+                                <h4>默认路由</h4>
+                            </div>
+                            <div class="routing-card-description">
+                                原样转发请求到目标站点，不做任何模型参数修改
+                            </div>
+                            <div class="routing-card-status" v-if="routingMode === 'default'">
+                                <el-tag type="success" size="small">已激活</el-tag>
+                            </div>
+                        </div>
+                        
+                        <div class="routing-card" 
+                             :class="{ active: routingMode === 'model-mapping' }"
+                             @click="selectRoutingMode('model-mapping')">
+                            <div class="routing-card-header">
+                                <i class="el-icon-s-operation"></i>
+                                <h4>模型|配置→模型映射</h4>
+                            </div>
+                            <div class="routing-card-description">
+                                将源请求模型|配置映射为其他模型，如sonnet4→opus4|xxx站点→opus4
+                            </div>
+                            <div class="routing-card-status" v-if="routingMode === 'model-mapping'">
+                                <el-tag type="success" size="small">已激活</el-tag>
+                            </div>
+                            <div class="routing-card-actions" v-if="routingMode === 'model-mapping'">
+                                <el-button type="text" size="small" @click.stop="openModelMappingDrawer">
+                                    <i class="el-icon-setting"></i> 配置映射
+                                </el-button>
+                            </div>
+                        </div>
+                        
+                        <div class="routing-card" 
+                             :class="{ active: routingMode === 'config-mapping' }"
+                             @click="selectRoutingMode('config-mapping')">
+                            <div class="routing-card-header">
+                                <i class="el-icon-s-tools"></i>
+                                <h4>模型→配置映射</h4>
+                            </div>
+                            <div class="routing-card-description">
+                                根据请求模型选择不同配置，如sonnet4用配置A
+                            </div>
+                            <div class="routing-card-status" v-if="routingMode === 'config-mapping'">
+                                <el-tag type="success" size="small">已激活</el-tag>
+                            </div>
+                            <div class="routing-card-actions" v-if="routingMode === 'config-mapping'">
+                                <el-button type="text" size="small" @click.stop="openConfigMappingDrawer">
+                                    <i class="el-icon-setting"></i> 配置映射
+                                </el-button>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 负载均衡 -->
+                <section class="loadbalance-section">
+                    <h2>负载均衡</h2>
+                    <div class="routing-grid">
+                        <div class="routing-card"
+                             :class="{ active: loadbalanceConfig.mode === 'active-first' }"
+                             @click="selectLoadbalanceMode('active-first')">
+                            <div class="routing-card-header">
+                                <i class="el-icon-switch-button"></i>
+                                <h4>按激活状态</h4>
+                            </div>
+                            <div class="routing-card-description">
+                                始终使用当前激活的配置转发请求。
+                            </div>
+                            <div class="routing-card-status" v-if="loadbalanceConfig.mode === 'active-first'">
+                                <el-tag type="success" size="small">已激活</el-tag>
+                            </div>
+                        </div>
+
+                        <div class="routing-card"
+                             :class="{ active: loadbalanceConfig.mode === 'weight-based' }"
+                             @click="selectLoadbalanceMode('weight-based')">
+                            <div class="routing-card-header">
+                                <i class="el-icon-data-analysis"></i>
+                                <h4>按权重</h4>
+                            </div>
+                            <div class="routing-card-description">
+                                依据配置权重排序转发目标，连续失败达到阈值将自动切换。
+                            </div>
+                            <div class="routing-card-status" v-if="loadbalanceConfig.mode === 'weight-based'">
+                                <el-tag type="success" size="small">已激活</el-tag>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="loadbalance-details" v-if="isLoadbalanceWeightMode" v-loading="loadbalanceLoading">
+                        <div class="lb-service-block" v-for="service in ['claude', 'codex']" :key="service">
+                            <div class="lb-block-header">
+                                <h4>{{ service === 'claude' ? 'Claude' : 'Codex' }} 转发顺序</h4>
+                                <el-button type="text" size="small"
+                                           :loading="resettingFailures[service]"
+                                           @click="resetLoadbalanceFailures(service)">
+                                    <i class="el-icon-refresh"></i> 重置失败计数
+                                </el-button>
+                            </div>
+                            <div class="lb-settings-row">
+                                <label class="lb-settings-label">自动重置间隔 (分钟)</label>
+                                <el-input-number
+                                    v-model="loadbalanceConfig.services[service].autoResetMinutes"
+                                    :min="0"
+                                    :max="1440"
+                                    :step="1"
+                                    :disabled="loadbalanceSaving"
+                                    @change="value => onAutoResetMinutesChange(service, value)">
+                                </el-input-number>
+                                <span class="lb-settings-hint">默认 10，0 表示不自动重置</span>
+                            </div>
+                            <el-empty description="未配置转发目标" v-if="weightedTargets[service].length === 0"></el-empty>
+                            <ul class="lb-weight-list" v-else>
+                                <li v-for="(item, index) in weightedTargets[service]"
+                                    :key="item.name"
+                                    :class="{ 'lb-failed': item.failures >= item.threshold }">
+                                    <span class="lb-rank">{{ index + 1 }}</span>
+                                    <div class="lb-info">
+                                        <div class="lb-name">
+                                            {{ item.name }}
+                                            <el-tag v-if="item.isActive" size="small" type="info">当前激活</el-tag>
+                                            <el-tag v-if="item.excluded" size="small" type="danger" effect="plain">已暂时跳过</el-tag>
+                                            <el-tag v-if="item.disabledToday" size="small" type="warning" effect="plain">今日禁用</el-tag>
+                                        </div>
+                                        <div class="lb-meta">
+                                            权重 {{ item.weight }} · 失败 {{ item.failures }} / {{ item.threshold }}
+                                        </div>
+                                        <div class="lb-actions">
+                                            <el-checkbox
+                                                class="lb-disable-checkbox"
+                                                :model-value="item.disabledToday"
+                                                size="small"
+                                                :disabled="loadbalanceSaving"
+                                                @change="checked => toggleManualDisableForToday(service, item.name, checked)">
+                                                今日禁用
+                                            </el-checkbox>
+                                            <el-button
+                                                type="primary"
+                                                size="small"
+                                                plain
+                                                @click.stop="pinWeightedTarget(service, item.name)"
+                                                :loading="pinningState[service].loading && pinningState[service].target === item.name"
+                                                :disabled="pinningState[service].loading && pinningState[service].target !== item.name">
+                                                顶置
+                                            </el-button>
+                                        </div>
+                                    </div>
+                                </li>
+                            </ul>
+                        </div>
+                    </div>
+                </section>
+
+
+            </main>
+        </div>
+
+        <!-- 配置编辑抽屉 -->
+        <el-drawer 
+            v-model="configDrawerVisible" 
+            title="配置文件编辑" 
+            :size="drawerSizes.config"
+            class="config-drawer">
+            
+            <div class="config-tabs">
+                <el-button 
+                    :type="activeConfigTab === 'claude' ? 'primary' : ''"
+                    @click="activeConfigTab = 'claude'"
+                    size="small">
+                    Claude 配置
+                </el-button>
+                <el-button 
+                    :type="activeConfigTab === 'codex' ? 'primary' : ''"
+                    @click="activeConfigTab = 'codex'"
+                    size="small">
+                    Codex 配置
+                </el-button>
+            </div>
+            
+            <div class="config-content">
+                <div v-show="activeConfigTab === 'claude'" class="tab-panel">
+                    <div class="config-editor">
+                        <!-- 模式切换区域 -->
+                        <div class="config-mode-tabs">
+                            <el-button
+                                :type="configEditMode === 'merged' ? 'primary' : ''"
+                                @click="switchToMergedMode"
+                                size="small">
+                                合并模式
+                            </el-button>
+                            <el-button
+                                :type="configEditMode === 'interactive' ? 'primary' : ''"
+                                @click="configEditMode = 'interactive'"
+                                size="small">
+                                <i class="el-icon-data-analysis mode-icon"></i>交互模式
+                            </el-button>
+                            <el-button
+                                :type="configEditMode === 'json' ? 'primary' : ''"
+                                @click="configEditMode = 'json'"
+                                size="small">
+                                JSON模式
+                            </el-button>
+                        </div>
+
+                        <!-- 合并模式内容区 -->
+                        <div v-show="configEditMode === 'merged'" class="merged-mode-container">
+                            <div class="config-form-header">
+                                <label>站点配置管理:</label>
+                                <div class="config-actions">
+                                    <el-button
+                                        type="success"
+                                        size="small"
+                                        @click="openMergedDialog('claude')">
+                                        添加站点
+                                    </el-button>
+                                    <el-button
+                                        type="primary"
+                                        size="small"
+                                        :loading="configSaving"
+                                        @click="saveMergedConfig('claude')">
+                                        保存配置
+                                    </el-button>
+                                </div>
+                            </div>
+
+                            <!-- 分组列表 -->
+                            <div class="merged-groups-container">
+                                <div
+                                    v-for="(group, groupIndex) in mergedConfigs.claude"
+                                    :key="group.baseUrl"
+                                    :class="['merged-group-card', { 'merged-group-active': isMergedGroupActive(group) }]">
+
+                                    <!-- 站点名称 -->
+                                    <div class="merged-group-names">
+                                        <el-tag
+                                            v-for="entry in group.entries"
+                                            :key="entry.siteId"
+                                            :type="entry.active ? 'success' : 'info'"
+                                            size="small"
+                                            class="merged-name-tag">
+                                            {{ entry.name }}
+                                        </el-tag>
+                                    </div>
+
+                                    <!-- 分组头部 -->
+                                    <div class="merged-group-header">
+                                        <div class="group-field">
+                                            <label>目标地址:</label>
+                                            <el-input
+                                                v-model="group.baseUrl"
+                                                placeholder="https://api.example.com"
+                                                @blur="applyMergedGroupUpdate('claude', groupIndex)"
+                                                style="width: 350px;">
+                                            </el-input>
+                                        </div>
+
+                                        <div class="group-field">
+                                            <label>权重:</label>
+                                            <el-input-number
+                                                v-model="group.weight"
+                                                :min="0"
+                                                :step="1"
+                                                @change="applyMergedGroupUpdate('claude', groupIndex)"
+                                                style="width: 120px;">
+                                            </el-input-number>
+                                        </div>
+
+                                        <div class="group-field">
+                                            <label>认证方式:</label>
+                                            <el-radio-group
+                                                v-model="group.authType"
+                                                @change="applyMergedGroupUpdate('claude', groupIndex)"
+                                                size="small">
+                                                <el-radio-button label="auth_token">Auth Token</el-radio-button>
+                                                <el-radio-button label="api_key">API Key</el-radio-button>
+                                            </el-radio-group>
+                                        </div>
+                                    </div>
+
+                                    <!-- 秘钥统计 -->
+                                    <div class="merged-group-summary">
+                                        <el-divider>
+                                            秘钥列表 · 共 {{ group.entries.length }} 条
+                                        </el-divider>
+                                    </div>
+
+                                    <!-- 分组底部操作 -->
+                                    <div class="merged-group-footer">
+                                        <el-button
+                                            type="primary"
+                                            size="small"
+                                            plain
+                                            @click="editMergedGroup('claude', groupIndex)">
+                                            编辑
+                                        </el-button>
+                                        <el-button
+                                            type="danger"
+                                            size="small"
+                                            plain
+                                            @click="deleteMergedGroup('claude', groupIndex)">
+                                            删除站点组
+                                        </el-button>
+                                    </div>
+                                </div>
+
+                                <!-- 空状态 -->
+                                <div v-if="mergedConfigs.claude.length === 0" class="merged-empty-state">
+                                    <el-empty description="暂无按目标地址聚合配置，可点击右上角添加站点"></el-empty>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 交互模式内容区 -->
+                        <div v-show="configEditMode === 'interactive'" class="interactive-mode-container">
+                            <div class="config-form-header">
+                                <label>站点配置管理:</label>
+                                <div class="config-actions">
+                                    <el-button
+                                        type="success"
+                                        size="small"
+                                        @click="startAddingSite('claude')">添加站点
+                                    </el-button>
+                                    <el-button
+                                        type="primary"
+                                        size="small"
+                                        :loading="configSaving"
+                                        @click="saveInteractiveConfig('claude')">保存配置
+                                    </el-button>
+                                </div>
+                            </div>
+
+                            <div class="config-sites-container">
+                                <!-- 新增站点编辑器 -->
+                                <div v-if="editingNewSite.claude" class="config-site-card new-site-editor">
+                                    <div class="config-field">
+                                        <label class="field-label">站点名称:</label>
+                                        <el-input
+                                            v-model="newSiteData.claude.name"
+                                            placeholder="例如: OpenAI-GPT4"
+                                            class="new-site-name-input"
+                                            @keyup.enter="confirmAddSite('claude')">
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">目标地址:</label>
+                                        <el-input
+                                            v-model="newSiteData.claude.baseUrl"
+                                            placeholder="例如: https://api.openai.com">
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">权重:</label>
+                                        <el-input-number
+                                            v-model.number="newSiteData.claude.weight"
+                                            :min="0"
+                                            :step="1">
+                                        </el-input-number>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">认证方式:</label>
+                                        <el-radio-group v-model="newSiteData.claude.authType">
+                                            <el-radio-button label="auth_token">Auth Token</el-radio-button>
+                                            <el-radio-button label="api_key">API Key</el-radio-button>
+                                        </el-radio-group>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">认证密钥:</label>
+                                        <el-input
+                                            v-model="newSiteData.claude.authValue"
+                                            :placeholder="newSiteData.claude.authType === 'auth_token' ? '认证令牌' : 'API密钥'"
+                                            type="password"
+                                            show-password>
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">激活状态:</label>
+                                        <div class="field-control">
+                                            <el-switch v-model="newSiteData.claude.active"></el-switch>
+                                            <div class="config-actions-inline">
+                                                <el-button @click="cancelAddSite('claude')" size="small">取消</el-button>
+                                                <el-button type="primary" @click="confirmAddSite('claude')" size="small">确认</el-button>
+                                                <el-button type="info" @click="testNewSiteConnection('claude')" size="small" plain>测试</el-button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- 现有站点列表 -->
+                                <div v-for="(site, index) in friendlyConfigs.claude" :key="index"
+                                     :class="['config-site-card', { 'site-active': site.active }]">
+                                    <div class="config-field">
+                                        <label class="field-label">站点名称:</label>
+                                        <el-input
+                                            v-model="site.name"
+                                            placeholder="站点名称"
+                                            @input="syncFormToJson('claude')">
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">目标地址:</label>
+                                        <el-input
+                                            v-model="site.baseUrl"
+                                            placeholder="目标站点地址"
+                                            @input="syncFormToJson('claude')">
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">权重:</label>
+                                        <el-input-number
+                                            v-model.number="site.weight"
+                                            :min="0"
+                                            :step="1"
+                                            @change="syncFormToJson('claude')"
+                                            @input="syncFormToJson('claude')">
+                                        </el-input-number>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">认证方式:</label>
+                                        <el-radio-group
+                                            v-model="site.authType"
+                                            @change="syncFormToJson('claude')">
+                                            <el-radio-button label="auth_token">Auth Token</el-radio-button>
+                                            <el-radio-button label="api_key">API Key</el-radio-button>
+                                        </el-radio-group>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">认证密钥:</label>
+                                        <el-input
+                                            v-model="site.authValue"
+                                            :placeholder="site.authType === 'auth_token' ? '认证令牌' : 'API密钥'"
+                                            type="password"
+                                            show-password
+                                            @input="syncFormToJson('claude')">
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">激活状态:</label>
+                                        <div class="field-control">
+                                            <el-switch
+                                                v-model="site.active"
+                                                @change="handleActiveChange('claude', index, $event)">
+                                            </el-switch>
+                                            <div class="config-actions-inline">
+                                                <el-button
+                                                    @click="removeConfigSite('claude', index)"
+                                                    type="danger"
+                                                    size="small">
+                                                    删除
+                                                </el-button>
+                                                <el-button
+                                                    @click="testSiteConnection('claude', index)"
+                                                    type="info"
+                                                    size="small"
+                                                    plain>
+                                                    测试
+                                                </el-button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="config-form-help" v-if="friendlyConfigs.claude.length === 0 && !editingNewSite.claude">
+                                    <p><em>暂无站点配置，点击"添加站点"按钮开始配置</em></p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- JSON模式内容区 -->
+                        <div v-show="configEditMode === 'json'" class="json-mode-container">
+                            <div class="config-form-header">
+                                <label>站点配置管理:</label>
+                                <div class="config-actions">
+                                    <el-button
+                                        type="primary"
+                                        @click="saveConfig"
+                                        :loading="configSaving"
+                                        size="small">
+                                        保存配置
+                                    </el-button>
+                                </div>
+                            </div>
+                            <label>claude.json 配置内容:</label>
+                            <el-input
+                                v-model="configContents.claude"
+                                type="textarea"
+                                :rows="20"
+                                placeholder="加载中..."
+                                style="font-family: monospace;">
+                            </el-input>
+                            <div class="config-help">
+                                <p><strong>示例结构:</strong></p>
+                                <code>{
+  "自定义站点名称": {
+    "base_url": "目标站点地址",
+    "auth_token": "令牌",
+    "api_key": "有些站点使用x-api-key传递就放这里",
+    "active": false
+  }
+}</code>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div v-show="activeConfigTab === 'codex'" class="tab-panel">
+                    <div class="config-editor">
+                        <!-- 模式切换区域 -->
+                        <div class="config-mode-tabs">
+                            <el-button
+                                :type="configEditMode === 'merged' ? 'primary' : ''"
+                                @click="switchToMergedMode"
+                                size="small">
+                                合并模式
+                            </el-button>
+                            <el-button
+                                :type="configEditMode === 'interactive' ? 'primary' : ''"
+                                @click="configEditMode = 'interactive'"
+                                size="small">
+                                <i class="el-icon-data-analysis mode-icon"></i>交互模式
+                            </el-button>
+                            <el-button
+                                :type="configEditMode === 'json' ? 'primary' : ''"
+                                @click="configEditMode = 'json'"
+                                size="small">
+                                JSON模式
+                            </el-button>
+                        </div>
+
+                        <!-- 合并模式内容区 -->
+                        <div v-show="configEditMode === 'merged'" class="merged-mode-container">
+                            <div class="config-form-header">
+                                <label>站点配置管理:</label>
+                                <div class="config-actions">
+                                    <el-button
+                                        type="success"
+                                        size="small"
+                                        @click="openMergedDialog('codex')">
+                                        添加站点
+                                    </el-button>
+                                    <el-button
+                                        type="primary"
+                                        size="small"
+                                        :loading="configSaving"
+                                        @click="saveMergedConfig('codex')">
+                                        保存配置
+                                    </el-button>
+                                </div>
+                            </div>
+
+                            <!-- 分组列表 -->
+                            <div class="merged-groups-container">
+                                <div
+                                    v-for="(group, groupIndex) in mergedConfigs.codex"
+                                    :key="group.baseUrl"
+                                    :class="['merged-group-card', { 'merged-group-active': isMergedGroupActive(group) }]">
+
+                                    <!-- 站点名称 -->
+                                    <div class="merged-group-names">
+                                        <el-tag
+                                            v-for="entry in group.entries"
+                                            :key="entry.siteId"
+                                            :type="entry.active ? 'success' : 'info'"
+                                            size="small"
+                                            class="merged-name-tag">
+                                            {{ entry.name }}
+                                        </el-tag>
+                                    </div>
+
+                                    <!-- 分组头部 -->
+                                    <div class="merged-group-header">
+                                        <div class="group-field">
+                                            <label>目标地址:</label>
+                                            <el-input
+                                                v-model="group.baseUrl"
+                                                placeholder="https://api.example.com"
+                                                @blur="applyMergedGroupUpdate('codex', groupIndex)"
+                                                style="width: 350px;">
+                                            </el-input>
+                                        </div>
+
+                                        <div class="group-field">
+                                            <label>权重:</label>
+                                            <el-input-number
+                                                v-model="group.weight"
+                                                :min="0"
+                                                :step="1"
+                                                @change="applyMergedGroupUpdate('codex', groupIndex)"
+                                                style="width: 120px;">
+                                            </el-input-number>
+                                        </div>
+
+                                        <div class="group-field">
+                                            <label>认证方式:</label>
+                                            <el-radio-group
+                                                v-model="group.authType"
+                                                @change="applyMergedGroupUpdate('codex', groupIndex)"
+                                                size="small">
+                                                <el-radio-button label="auth_token">Auth Token</el-radio-button>
+                                                <el-radio-button label="api_key">API Key</el-radio-button>
+                                            </el-radio-group>
+                                        </div>
+                                    </div>
+
+                                    <!-- 秘钥统计 -->
+                                    <div class="merged-group-summary">
+                                        <el-divider>
+                                            秘钥列表 · 共 {{ group.entries.length }} 条
+                                        </el-divider>
+                                    </div>
+
+                                    <!-- 分组底部操作 -->
+                                    <div class="merged-group-footer">
+                                        <el-button
+                                            type="primary"
+                                            size="small"
+                                            plain
+                                            @click="editMergedGroup('codex', groupIndex)">
+                                            编辑
+                                        </el-button>
+                                        <el-button
+                                            type="danger"
+                                            size="small"
+                                            plain
+                                            @click="deleteMergedGroup('codex', groupIndex)">
+                                            删除站点组
+                                        </el-button>
+                                    </div>
+                                </div>
+
+                                <!-- 空状态 -->
+                                <div v-if="mergedConfigs.codex.length === 0" class="merged-empty-state">
+                                    <el-empty description="暂无按目标地址聚合配置，可点击右上角添加站点"></el-empty>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 交互模式内容区 -->
+                        <div v-show="configEditMode === 'interactive'" class="interactive-mode-container">
+                            <div class="config-form-header">
+                                <label>站点配置管理:</label>
+                                <div class="config-actions">
+                                    <el-button
+                                        type="success"
+                                        size="small"
+                                        @click="startAddingSite('codex')">添加站点
+                                    </el-button>
+                                    <el-button
+                                        type="primary"
+                                        size="small"
+                                        :loading="configSaving"
+                                        @click="saveInteractiveConfig('codex')">保存配置
+                                    </el-button>
+                                </div>
+                            </div>
+
+                            <div class="config-sites-container">
+                                <!-- 新增站点编辑器 -->
+                                <div v-if="editingNewSite.codex" class="config-site-card new-site-editor">
+                                    <div class="config-field">
+                                        <label class="field-label">站点名称:</label>
+                                        <el-input
+                                            v-model="newSiteData.codex.name"
+                                            placeholder="例如: OpenAI-GPT4"
+                                            class="new-site-name-input"
+                                            @keyup.enter="confirmAddSite('codex')">
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">目标地址:</label>
+                                        <el-input
+                                            v-model="newSiteData.codex.baseUrl"
+                                            placeholder="例如: https://api.openai.com">
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">权重:</label>
+                                        <el-input-number
+                                            v-model.number="newSiteData.codex.weight"
+                                            :min="0"
+                                            :step="1">
+                                        </el-input-number>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">认证方式:</label>
+                                        <el-radio-group v-model="newSiteData.codex.authType">
+                                            <el-radio-button label="auth_token">Auth Token</el-radio-button>
+                                            <el-radio-button label="api_key">API Key</el-radio-button>
+                                        </el-radio-group>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">认证密钥:</label>
+                                        <el-input
+                                            v-model="newSiteData.codex.authValue"
+                                            :placeholder="newSiteData.codex.authType === 'auth_token' ? '认证令牌' : 'API密钥'"
+                                            type="password"
+                                            show-password>
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">激活状态:</label>
+                                        <div class="field-control">
+                                            <el-switch v-model="newSiteData.codex.active"></el-switch>
+                                            <div class="config-actions-inline">
+                                                <el-button @click="cancelAddSite('codex')" size="small">取消</el-button>
+                                                <el-button type="primary" @click="confirmAddSite('codex')" size="small">确认</el-button>
+                                                <el-button type="info" @click="testNewSiteConnection('codex')" size="small" plain>测试</el-button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- 现有站点列表 -->
+                                <div v-for="(site, index) in friendlyConfigs.codex" :key="index"
+                                     :class="['config-site-card', { 'site-active': site.active }]">
+                                    <div class="config-field">
+                                        <label class="field-label">站点名称:</label>
+                                        <el-input
+                                            v-model="site.name"
+                                            placeholder="站点名称"
+                                            @input="syncFormToJson('codex')">
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">目标地址:</label>
+                                        <el-input
+                                            v-model="site.baseUrl"
+                                            placeholder="目标站点地址"
+                                            @input="syncFormToJson('codex')">
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">权重:</label>
+                                        <el-input-number
+                                            v-model.number="site.weight"
+                                            :min="0"
+                                            :step="1"
+                                            @change="syncFormToJson('codex')"
+                                            @input="syncFormToJson('codex')">
+                                        </el-input-number>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">认证方式:</label>
+                                        <el-radio-group
+                                            v-model="site.authType"
+                                            @change="syncFormToJson('codex')">
+                                            <el-radio-button label="auth_token">Auth Token</el-radio-button>
+                                            <el-radio-button label="api_key">API Key</el-radio-button>
+                                        </el-radio-group>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">认证密钥:</label>
+                                        <el-input
+                                            v-model="site.authValue"
+                                            :placeholder="site.authType === 'auth_token' ? '认证令牌' : 'API密钥'"
+                                            type="password"
+                                            show-password
+                                            @input="syncFormToJson('codex')">
+                                        </el-input>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">激活状态:</label>
+                                        <div class="field-control">
+                                            <el-switch
+                                                v-model="site.active"
+                                                @change="handleActiveChange('codex', index, $event)">
+                                            </el-switch>
+                                            <div class="config-actions-inline">
+                                                <el-button
+                                                    @click="removeConfigSite('codex', index)"
+                                                    type="danger"
+                                                    size="small">
+                                                    删除
+                                                </el-button>
+                                                <el-button
+                                                    @click="testSiteConnection('codex', index)"
+                                                    type="info"
+                                                    size="small"
+                                                    plain>
+                                                    测试
+                                                </el-button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="config-form-help" v-if="friendlyConfigs.codex.length === 0 && !editingNewSite.codex">
+                                    <p><em>暂无站点配置，点击"添加站点"按钮开始配置</em></p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- JSON模式内容区 -->
+                        <div v-show="configEditMode === 'json'" class="json-mode-container">
+                            <div class="config-form-header">
+                                <label>站点配置管理:</label>
+                                <div class="config-actions">
+                                    <el-button
+                                        type="primary"
+                                        @click="saveConfig"
+                                        :loading="configSaving"
+                                        size="small">
+                                        保存配置
+                                    </el-button>
+                                </div>
+                            </div>
+                            <label>codex.json 配置内容:</label>
+                            <el-input
+                                v-model="configContents.codex"
+                                type="textarea"
+                                :rows="20"
+                                placeholder="加载中..."
+                                style="font-family: monospace;">
+                            </el-input>
+                            <div class="config-help">
+                                <p><strong>示例结构:</strong></p>
+                                <code>{
+  "自定义站点名称": {
+    "base_url": "目标站点地址",
+    "auth_token": "令牌",
+    "api_key": "有些站点使用x-api-key传递就放这里",
+    "active": false
+  }
+}</code>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </el-drawer>
+
+        <!-- 过滤器编辑抽屉 -->
+        <el-drawer 
+            v-model="filterDrawerVisible" 
+            title="请求过滤器编辑" 
+            :size="drawerSizes.filter"
+            class="filter-drawer">
+            
+            <div class="config-content">
+                <div class="tab-panel active">
+                    <div class="filter-editor">
+                        <label>过滤规则配置:</label>
+                        <div class="filter-rules-container">
+                            <div v-for="(rule, index) in filterRules" :key="index" class="filter-rule-row">
+                                <el-input
+                                    v-model="rule.source"
+                                    placeholder="要匹配的文本"
+                                    size="small"
+                                    style="width: 180px">
+                                </el-input>
+                                <el-select 
+                                    v-model="rule.op" 
+                                    size="small"
+                                    style="width: 100px; margin: 0 10px">
+                                    <el-option label="替换" value="replace"></el-option>
+                                    <el-option label="删除" value="remove"></el-option>
+                                </el-select>
+                                <el-input
+                                    v-model="rule.target"
+                                    placeholder="替换后的文本"
+                                    :disabled="rule.op === 'remove'"
+                                    size="small"
+                                    style="width: 180px">
+                                </el-input>
+                                <el-button 
+                                    @click="removeFilterRule(index)" 
+                                    type="danger" 
+                                    icon="el-icon-delete" 
+                                    circle
+                                    size="small">
+                                </el-button>
+                            </div>
+                            <el-button 
+                                @click="addFilterRule" 
+                                type="success" 
+                                size="small"
+                                icon="el-icon-plus"
+                                style="margin-top: 10px">
+                                添加规则
+                            </el-button>
+                        </div>
+                        <div class="filter-help">
+                            <p><strong>使用说明:</strong></p>
+                            <p>• 每行一个规则，按顺序执行</p>
+                            <p>• 选择"替换"时，将source替换为target</p>
+                            <p>• 选择"删除"时，将删除source匹配的内容</p>
+                            <p>• 支持正则表达式</p>
+                        </div>
+                        <div class="editor-actions">
+                            <el-button 
+                                type="primary" 
+                                @click="saveFilter" 
+                                :loading="filterSaving"
+                                size="small">
+                                保存过滤规则
+                            </el-button>
+                            <el-button 
+                                @click="loadFilter" 
+                                size="small">
+                                重新加载
+                            </el-button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </el-drawer>
+
+        <!-- 日志详情侧边栏 -->
+        <el-drawer
+            v-model="logDetailVisible"
+            title="请求日志详情"
+            :size="drawerSizes.logDetail"
+            class="log-detail-drawer">
+            
+            <div v-if="selectedLog" class="log-detail-content">
+                <!-- Tab切换导航 -->
+                <el-tabs v-model="activeLogTab" class="log-detail-tabs">
+                    <!-- Tab 1: 基础 -->
+                    <el-tab-pane label="基础" name="basic">
+                        <div class="detail-section">
+                            <div class="detail-basic-list">
+                                <div class="detail-row">
+                                    <span class="label">时间:</span>
+                                    <span class="value">{{ selectedLog.timestamp || '-' }}</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="label">服务:</span>
+                                    <span class="value">{{ selectedLog.service || '-' }}</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="label">渠道:</span>
+                                    <span class="value">{{ formatChannelName(selectedLog.channel) }}</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="label">方法:</span>
+                                    <span class="value">{{ selectedLog.method || '-' }}</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="label">状态码:</span>
+                                    <span class="value">
+                                        <el-tag :type="getStatusTagType(selectedLog.status_code)">
+                                            {{ selectedLog.status_code || '-' }}
+                                        </el-tag>
+                                    </span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="label">耗时:</span>
+                                    <span class="value">{{ selectedLog.duration_ms ? `${selectedLog.duration_ms}ms` : '-' }}</span>
+                                </div>
+                                <div class="detail-row">
+                                    <span class="label">请求路径:</span>
+                                    <span class="value">
+                                        <code class="path-code">{{ selectedLog.path || '-' }}</code>
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="detail-section usage-section">
+                            <h4>Usage 指标</h4>
+                            <div class="usage-grid">
+                                <div class="usage-item" v-for="(label, key) in usageMetricLabels" :key="key">
+                                    <span class="usage-label">{{ label }}:</span>
+                                    <span class="usage-value">{{ formatUsageValue(selectedLog.usage?.metrics?.[key] || 0) }}</span>
+                                </div>
+                            </div>
+                        </div>
+                    </el-tab-pane>
+
+                    <!-- Tab 2: 请求 -->
+                    <el-tab-pane label="请求" name="request">
+                        <div class="detail-section">
+                            <!-- Switch开关：控制显示替换前/替换后 -->
+                            <div class="request-transform-switch" style="margin-bottom: 16px;">
+                                <span style="margin-right: 8px; color: #606266;">显示替换后数据：</span>
+                                <el-switch v-model="showTransformedData"></el-switch>
+                            </div>
+
+                            <!-- 子Tab：请求头和请求体 -->
+                            <el-tabs v-model="activeRequestSubTab" type="card">
+                                <!-- 子Tab 2.1: 请求头 -->
+                                <el-tab-pane label="请求头" name="headers">
+                                    <div class="headers-content-flat">
+                                        <div v-if="showTransformedData">
+                                            <!-- 显示替换后的请求头 -->
+                                            <div v-if="!selectedLog.target_headers || Object.keys(selectedLog.target_headers).length === 0" class="no-headers">
+                                                暂无请求头信息
+                                            </div>
+                                            <div v-else class="headers-list-flat">
+                                                <div
+                                                    v-for="key in getSortedHeaderKeys(selectedLog.target_headers)"
+                                                    :key="key"
+                                                    class="header-item-flat">
+                                                    <span class="header-key-flat">{{ key }}:</span>
+                                                    <span class="header-value-flat">{{ selectedLog.target_headers[key] }}</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div v-else>
+                                            <!-- 显示替换前的请求头 -->
+                                            <div v-if="!selectedLog.original_headers || Object.keys(selectedLog.original_headers).length === 0" class="no-headers">
+                                                暂无请求头信息
+                                            </div>
+                                            <div v-else class="headers-list-flat">
+                                                <div
+                                                    v-for="key in getSortedHeaderKeys(selectedLog.original_headers)"
+                                                    :key="key"
+                                                    class="header-item-flat">
+                                                    <span class="header-key-flat">{{ key }}:</span>
+                                                    <span class="header-value-flat">{{ selectedLog.original_headers[key] }}</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </el-tab-pane>
+
+                                <!-- 子Tab 2.2: 请求体 -->
+                                <el-tab-pane label="请求体" name="body">
+                                    <div v-if="showTransformedData">
+                                        <!-- 显示替换后的请求体 -->
+                                        <div v-if="!selectedLog.filtered_body" class="no-body">
+                                            暂无请求体内容
+                                        </div>
+                                        <div v-else class="request-body-fullscreen-container">
+                                            <div class="body-actions">
+                                                <el-button
+                                                    size="small"
+                                                    @click="copyToClipboard(decodedRequestBody)">
+                                                    复制内容
+                                                </el-button>
+                                                <el-button
+                                                    size="small"
+                                                    @click="formatFilteredRequestBody">
+                                                    格式化JSON
+                                                </el-button>
+                                            </div>
+                                            <el-input
+                                                v-model="decodedRequestBody"
+                                                type="textarea"
+                                                readonly
+                                                class="request-body-textarea-fullscreen">
+                                            </el-input>
+                                        </div>
+                                    </div>
+                                    <div v-else>
+                                        <!-- 显示替换前的请求体 -->
+                                        <div v-if="!selectedLog.original_body" class="no-body">
+                                            暂无请求体内容
+                                        </div>
+                                        <div v-else class="request-body-fullscreen-container">
+                                            <div class="body-actions">
+                                                <el-button
+                                                    size="small"
+                                                    @click="copyToClipboard(decodedOriginalRequestBody)">
+                                                    复制内容
+                                                </el-button>
+                                                <el-button
+                                                    size="small"
+                                                    @click="formatOriginalRequestBody">
+                                                    格式化JSON
+                                                </el-button>
+                                            </div>
+                                            <el-input
+                                                v-model="decodedOriginalRequestBody"
+                                                type="textarea"
+                                                readonly
+                                                class="request-body-textarea-fullscreen">
+                                            </el-input>
+                                        </div>
+                                    </div>
+                                </el-tab-pane>
+                            </el-tabs>
+                        </div>
+                    </el-tab-pane>
+
+                    <!-- Tab 3: 响应 -->
+                    <el-tab-pane label="响应" name="response">
+                        <div class="detail-section">
+                            <!-- 子Tab：响应头和响应体 -->
+                            <el-tabs v-model="activeResponseSubTab" type="card">
+                                <!-- 子Tab 3.1: 响应头 -->
+                                <el-tab-pane label="响应头" name="headers">
+                                    <div class="headers-content-flat">
+                                        <div v-if="!selectedLog.response_headers || Object.keys(selectedLog.response_headers).length === 0" class="no-headers">
+                                            暂无响应头信息
+                                        </div>
+                                        <div v-else class="headers-list-flat">
+                                            <div
+                                                v-for="key in getSortedHeaderKeys(selectedLog.response_headers)"
+                                                :key="key"
+                                                class="header-item-flat">
+                                                <span class="header-key-flat">{{ key }}:</span>
+                                                <span class="header-value-flat">{{ selectedLog.response_headers[key] }}</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </el-tab-pane>
+
+                                <!-- 子Tab 3.2: 响应体 -->
+                                <el-tab-pane label="响应体" name="body">
+                                    <div v-if="!selectedLog.response_content" class="no-body">
+                                        暂无响应内容
+                                    </div>
+                                    <div v-else class="request-body-fullscreen-container">
+                                        <div class="body-actions">
+                                            <el-button
+                                                size="small"
+                                                @click="copyToClipboard(decodedResponseContent)">
+                                                复制内容
+                                            </el-button>
+                                            <el-button
+                                                v-if="canParseSelectedLog"
+                                                size="small"
+                                                :type="isResponseContentParsed ? 'default' : 'primary'"
+                                                :disabled="!responseOriginalContent"
+                                                @click="toggleParsedResponse">
+                                                {{ isResponseContentParsed ? '还原响应' : '解析响应' }}
+                                            </el-button>
+                                        </div>
+                                        <el-input
+                                            v-model="decodedResponseContent"
+                                            type="textarea"
+                                            readonly
+                                            class="request-body-textarea-fullscreen">
+                                        </el-input>
+                                    </div>
+                                </el-tab-pane>
+                            </el-tabs>
+                        </div>
+                    </el-tab-pane>
+                </el-tabs>
+            </div>
+        </el-drawer>
+
+        <!-- 所有日志侧边栏 -->
+        <el-drawer 
+            v-model="allLogsVisible" 
+            title="请求详情" 
+            :size="drawerSizes.allLogs"
+            class="all-logs-drawer">
+            
+            <div class="all-logs-content" v-loading="allLogsLoading">
+                <!-- 实时请求模块 -->
+                <section class="realtime-section">
+                    <div class="realtime-header">
+                        <h3>实时请求</h3>
+                        <div class="realtime-status-actions">
+                            <div class="connection-status">
+                                <el-tag v-if="connectionStatus.claude" type="success" size="small">Claude 已连接</el-tag>
+                                <el-tag v-else type="danger" size="small">Claude 未连接</el-tag>
+                                <el-tag v-if="connectionStatus.codex" type="success" size="small">Codex 已连接</el-tag>
+                                <el-tag v-else type="danger" size="small">Codex 未连接</el-tag>
+                            </div>
+                            <el-button 
+                                v-if="!connectionStatus.claude && !connectionStatus.codex"
+                                type="primary" 
+                                size="small" 
+                                @click="reconnectRealtime">
+                                连接
+                            </el-button>
+                            <el-button 
+                                v-else
+                                type="danger" 
+                                size="small" 
+                                @click="disconnectRealtime">
+                                断开
+                            </el-button>
+                        </div>
+                    </div>
+                    <div class="realtime-requests-container">
+                        <div v-if="realtimeRequests.length === 0" class="no-realtime-requests">
+                            <span>暂无实时请求</span>
+                        </div>
+                        <div v-else class="realtime-container">
+                            <div class="realtime-table-header">
+                                <span>服务</span>
+                                <span>路径</span>
+                                <span>状态</span>
+                                <span>耗时</span>
+                                <span>操作</span>
+                            </div>
+                            <div class="realtime-entries">
+                                <div 
+                                    v-for="request in realtimeRequests" 
+                                    :key="request.request_id"
+                                    class="realtime-entry"
+                                    @click="showRealtimeDetail(request)">
+                                    <span>{{ request.service }}{{ request.channel ? ` [${request.channel}]` : '' }}</span>
+                                    <span :title="request.path">{{ request.path }}</span>
+                                    <span>
+                                        <el-tag :type="getStatusDisplay(request.status).type" size="small">
+                                            {{ getStatusDisplay(request.status).text }}
+                                        </el-tag>
+                                    </span>
+                                    <span>{{ request.displayDuration }}ms</span>
+                                    <span>
+                                        <el-button 
+                                            type="primary" 
+                                            size="small" 
+                                            link
+                                            @click.stop="showRealtimeDetail(request)">
+                                            详情
+                                        </el-button>
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+                <div class="history-requests-section">
+                    <h3>历史所有请求</h3>
+                    <div class="all-logs-stats">
+                        <span>  共 {{ allLogs.length }} 条日志，仅保留最近:
+                            <el-select
+                                v-model="systemConfig.logLimit"
+                                @change="handleLogLimitChange"
+                                size="small"
+                                style="width: 70px; margin: 0 4px;">
+                                <el-option :value="10" label="10"></el-option>
+                                <el-option :value="30" label="30"></el-option>
+                                <el-option :value="50" label="50"></el-option>
+                                <el-option :value="100" label="100"></el-option>
+                            </el-select>
+                            条
+                        </span>
+                        <div class="stats-actions">
+                            <el-button
+                                type="primary"
+                                size="small"
+                                @click="refreshAllLogs"
+                                :loading="allLogsLoading">
+                                刷新
+                            </el-button>
+                            <el-button
+                                type="danger"
+                                size="small"
+                                @click="clearAllLogs">
+                                清空日志
+                            </el-button>
+                        </div>
+                    </div>
+
+                <div class="all-logs-table-container">
+                        <!-- 固定表头 -->
+                        <div class="log-header log-header-fixed">
+                            <span>时间</span>
+                            <span>服务</span>
+                            <span>URL</span>
+                            <span>状态</span>
+                            <span>耗时</span>
+                            <span>Usage</span>
+                            <span>操作</span>
+                        </div>
+
+                        <!-- 滚动内容区 -->
+                        <div class="all-log-entries-scrollable">
+                            <div v-if="allLogs.length === 0" class="log-entry loading">
+                                <span>{{ allLogsLoading ? '加载日志数据...' : '暂无日志数据' }}</span>
+                            </div>
+                            <div v-else v-for="log in allLogs" :key="log.id || log.timestamp" class="log-entry">
+                                <span>{{ formatTimestamp(log.timestamp) }}</span>
+                                <span :title="formatChannelName(log.channel)" style="white-space: pre-line;">{{ formatServiceWithChannel(log.service, log.channel) }}</span>
+                                <span class="url-column" :title="log.path">{{ formatMethodWithURL(log.method, log.path) }}</span>
+                                <span>
+                                    <el-tag
+                                        :type="getStatusTagType(log.status_code)"
+                                        size="small">
+                                        {{ log.status_code || '-' }}
+                                    </el-tag>
+                                </span>
+                                <span>{{ log.duration_ms ? `${log.duration_ms}ms` : '-' }}</span>
+                                <span class="usage-cell" :title="formatUsageSummary(log.usage, log.service)">
+                                    {{ formatUsageSummary(log.usage, log.service) }}
+                                </span>
+                                <span>
+                                    <el-button
+                                        type="primary"
+                                        size="small"
+                                        link
+                                        @click="showLogDetail(log)">
+                                        详情
+                                    </el-button>
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </el-drawer>
+
+        <!-- 模型选择弹框 -->
+        <el-dialog
+            v-model="modelSelectorVisible"
+            title="选择模型进行测试"
+            :width="dialogSizes.modelSelector"
+            @close="cancelModelSelection">
+            <div class="model-selector-content">
+                <el-form
+                    :model="testConfig"
+                    :label-width="isMobileViewport ? 'auto' : '80px'"
+                    :label-position="isMobileViewport ? 'top' : 'right'">
+                    <el-form-item label="模型:">
+                        <el-select
+                            v-model="testConfig.model"
+                            placeholder="请选择或输入模型名称"
+                            style="width: 100%"
+                            filterable
+                            allow-create>
+                            <el-option
+                                v-for="model in getModelOptions(testConfig.service)"
+                                :key="model.value"
+                                :label="model.label"
+                                :value="model.value">
+                            </el-option>
+                        </el-select>
+                    </el-form-item>
+                    <el-form-item v-if="testConfig.service === 'codex'" label="推理等级:">
+                        <el-select
+                            v-model="testConfig.reasoningEffort"
+                            placeholder="请选择推理等级"
+                            style="width: 100%">
+                            <el-option label="high" value="high"></el-option>
+                            <el-option label="medium" value="medium"></el-option>
+                            <el-option label="low" value="low"></el-option>
+                            <el-option label="minimal" value="minimal"></el-option>
+                        </el-select>
+                    </el-form-item>
+                </el-form>
+
+                <!-- 测试结果显示区域 -->
+                <div v-if="lastTestResult.status_code !== null || testingConnection" class="test-result-section" style="margin-top: 20px; border-top: 1px solid #e4e7ed; padding-top: 16px;">
+                    <h4 style="margin: 0 0 12px 0; font-size: 14px; color: #606266;">测试结果</h4>
+
+                    <div v-if="testingConnection" style="text-align: center; padding: 20px;">
+                        <el-icon class="is-loading" style="font-size: 20px; margin-bottom: 8px;"><Loading /></el-icon>
+                        <div style="color: #909399;">正在测试连接...</div>
+                    </div>
+
+                    <div v-else-if="lastTestResult.status_code !== null">
+                        <div class="test-result-summary">
+                            <div class="result-item">
+                                <span class="result-label">测试状态:</span>
+                                <el-tag :type="lastTestResult.success ? 'success' : 'danger'" size="default">
+                                    {{ lastTestResult.success ? '连接成功' : '连接失败' }}
+                                </el-tag>
+                            </div>
+                            <div class="result-item">
+                                <span class="result-label">状态码:</span>
+                                <span class="result-value">{{ lastTestResult.status_code || '-' }}</span>
+                            </div>
+                            <div class="result-item">
+                                <span class="result-label">目标URL:</span>
+                                <span class="result-value">{{ lastTestResult.target_url || '-' }}</span>
+                            </div>
+                            <div v-if="lastTestResult.error_message" class="result-item">
+                                <span class="result-label">错误信息:</span>
+                                <span class="result-value error">{{ lastTestResult.error_message }}</span>
+                            </div>
+                        </div>
+
+                        <div v-if="lastTestResult.status_code !== null" class="test-response-section" style="margin-top: 16px;">
+                            <h5 style="margin: 0 0 8px 0; font-size: 13px; color: #606266;">响应数据:</h5>
+                            <el-input
+                                v-model="lastTestResult.response_text"
+                                type="textarea"
+                                :rows="6"
+                                readonly
+                                placeholder="无响应数据">
+                            </el-input>
+                            <div class="response-actions" style="margin-top: 8px; text-align: right;">
+                                <el-button size="small" @click="copyTestResult">复制响应</el-button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <template #footer>
+                <span class="dialog-footer">
+                    <el-button @click="cancelModelSelection">
+                        {{ lastTestResult.status_code !== null ? '关闭' : '取消' }}
+                    </el-button>
+                    <el-button
+                        v-if="lastTestResult.status_code === null"
+                        type="primary"
+                        @click="confirmModelSelection"
+                        :loading="testingConnection">
+                        开始测试
+                    </el-button>
+                    <el-button
+                        v-else
+                        type="primary"
+                        @click="confirmModelSelection"
+                        :loading="testingConnection">
+                        重新测试
+                    </el-button>
+                </span>
+            </template>
+        </el-dialog>
+
+        <!-- Usage详情抽屉 -->
+        <el-drawer
+            v-model="usageDrawerVisible"
+            title="Token 使用详情"
+            :size="drawerSizes.usage"
+            class="usage-drawer">
+            <div class="usage-drawer-content" v-loading="usageDetailsLoading">
+                <div class="usage-summary-card">
+                    <h3>总体汇总</h3>
+                    <div class="usage-summary-grid">
+                        <div class="usage-summary-item" v-for="key in metricKeys" :key="key">
+                            <span class="usage-label">{{ usageMetricLabels[key] }}:</span>
+                            <span class="usage-value">{{ getUsageFormattedValue(usageDetails.totals, key) }}</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="usage-service-section" v-for="(serviceData, serviceName) in usageDetails.services" :key="serviceName">
+                    <div class="usage-service-header">
+                        <h3>{{ serviceName }} CLI</h3>
+                        <span class="usage-total">总计 {{ getUsageFormattedValue(serviceData.overall, 'total') }}</span>
+                    </div>
+                    <div class="usage-summary-grid service-overall">
+                        <div class="usage-summary-item" v-for="key in metricKeys" :key="key">
+                            <span class="usage-label">{{ usageMetricLabels[key] }}:</span>
+                            <span class="usage-value">{{ getUsageFormattedValue(serviceData.overall, key) }}</span>
+                        </div>
+                    </div>
+                    <div v-if="Object.keys(serviceData.channels).length" class="usage-channel-table">
+                        <div class="usage-channel-header">
+                            <span>目标站点</span>
+                            <span v-for="key in metricKeys" :key="key">{{ usageMetricLabels[key] }}</span>
+                        </div>
+                        <div class="usage-channel-row" v-for="(channelData, channelName) in serviceData.channels" :key="channelName">
+                            <span class="channel-name">{{ formatChannelName(channelName) }}</span>
+                            <span v-for="key in metricKeys" :key="key">{{ getUsageFormattedValue(channelData, key) }}</span>
+                        </div>
+                    </div>
+                    <div v-else class="usage-channel-empty">暂无渠道数据</div>
+                </div>
+
+                <div class="usage-drawer-actions">
+                    <el-button type="primary" size="small" @click="loadUsageDetails" :loading="usageDetailsLoading">刷新</el-button>
+                    <el-button type="danger" size="small" @click="clearUsageData">清空Token</el-button>
+                    <el-button size="small" @click="closeUsageDrawer">关闭</el-button>
+                </div>
+            </div>
+        </el-drawer>
+
+        <!-- 实时请求详情抽屉 -->
+        <el-drawer
+            v-model="realtimeDetailVisible"
+            title="实时请求详情"
+            :size="drawerSizes.realtime"
+            direction="rtl"
+            class="realtime-detail-drawer">
+
+            <div v-if="selectedRealtimeRequest" class="realtime-detail-content">
+                <div class="detail-basic-info">
+                    <el-descriptions title="基本信息" :column="2" border>
+                        <el-descriptions-item label="请求ID">
+                            {{ selectedRealtimeRequest.request_id }}
+                        </el-descriptions-item>
+                        <el-descriptions-item label="服务">
+                            {{ selectedRealtimeRequest.service }}
+                        </el-descriptions-item>
+                        <el-descriptions-item label="渠道">
+                            {{ selectedRealtimeRequest.channel }}
+                        </el-descriptions-item>
+                        <el-descriptions-item label="状态">
+                            <el-tag :type="getStatusDisplay(selectedRealtimeRequest.status).type">
+                                {{ getStatusDisplay(selectedRealtimeRequest.status).text }}
+                            </el-tag>
+                        </el-descriptions-item>
+                        <el-descriptions-item label="方法">
+                            {{ selectedRealtimeRequest.method }}
+                        </el-descriptions-item>
+                        <el-descriptions-item label="路径">
+                            {{ selectedRealtimeRequest.path }}
+                        </el-descriptions-item>
+                        <el-descriptions-item label="耗时">
+                            {{ selectedRealtimeRequest.displayDuration }}ms
+                        </el-descriptions-item>
+                        <el-descriptions-item label="状态码" v-if="selectedRealtimeRequest.status_code">
+                            {{ selectedRealtimeRequest.status_code }}
+                        </el-descriptions-item>
+                        <el-descriptions-item label="开始时间">
+                            {{ formatRealtimeTime(selectedRealtimeRequest.start_time) }}
+                        </el-descriptions-item>
+                        <el-descriptions-item label="目标URL" v-if="selectedRealtimeRequest.target_url">
+                            {{ selectedRealtimeRequest.target_url }}
+                        </el-descriptions-item>
+                    </el-descriptions>
+                </div>
+
+                <div class="detail-response-section">
+                    <h4>实时响应流</h4>
+                    <div class="response-stream-container">
+                        <div class="response-stream-content">
+                            <pre v-if="selectedRealtimeRequest.responseText">{{ selectedRealtimeRequest.responseText }}</pre>
+                            <div v-else class="no-response">暂无响应数据...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="detail-headers-section" v-if="selectedRealtimeRequest.request_headers">
+                    <h4>请求头</h4>
+                    <div class="headers-content">
+                        <pre>{{ JSON.stringify(selectedRealtimeRequest.request_headers, null, 2) }}</pre>
+                    </div>
+                </div>
+            </div>
+        </el-drawer>
+
+        <!-- 模型|配置→模型映射配置抽屉 -->
+        <el-drawer
+            v-model="modelMappingDrawerVisible"
+            title="模型|配置→模型映射配置"
+            :size="drawerSizes.modelMapping"
+            direction="rtl"
+            class="mapping-drawer">
+            <div class="mapping-drawer-content">
+                <div class="mapping-tabs">
+                    <el-tabs type="border-card" v-model="activeModelMappingTab">
+                        <el-tab-pane label="Claude 模型映射" name="claude">
+                            <div class="mapping-section">
+                                <div class="mapping-header">
+                                    <h4>Claude 模型映射规则</h4>
+                                    <el-button type="primary" size="small" @click="addModelMapping('claude')">
+                                        <i class="el-icon-plus"></i> 添加映射
+                                    </el-button>
+                                </div>
+                                
+                                <div class="mapping-list" v-if="routingConfig.modelMappings.claude.length > 0">
+                                    <div class="mapping-item" v-for="(mapping, index) in routingConfig.modelMappings.claude" :key="index">
+                                        <div class="mapping-form-horizontal">
+                                            <div class="mapping-field-group">
+                                                <div class="mapping-field-compact">
+                                                    <label>源类型:</label>
+                                                    <el-select
+                                                        v-model="mapping.source_type"
+                                                        placeholder="选择类型"
+                                                        size="small"
+                                                        style="width: 80px;">
+                                                        <el-option label="模型" value="model"></el-option>
+                                                        <el-option label="配置" value="config"></el-option>
+                                                    </el-select>
+                                                </div>
+                                                <div class="mapping-field-compact">
+                                                    <label v-if="mapping.source_type === 'model'">源模型:</label>
+                                                    <label v-else>使用配置:</label>
+                                                    <el-select
+                                                        v-if="mapping.source_type === 'config'"
+                                                        v-model="mapping.source"
+                                                        placeholder="选择配置"
+                                                        size="small"
+                                                        style="width: 520px;">
+                                                        <el-option
+                                                            v-for="config in claudeConfigs"
+                                                            :key="config"
+                                                            :label="config"
+                                                            :value="config">
+                                                        </el-option>
+                                                    </el-select>
+                                                    <el-input
+                                                        v-else
+                                                        v-model="mapping.source"
+                                                        placeholder="例如: claude-sonnet-4-20250514"
+                                                        size="small"
+                                                        style="width: 220px;">
+                                                    </el-input>
+                                                </div>
+                                                <div class="mapping-arrow-compact">→</div>
+                                                <div class="mapping-field-compact">
+                                                    <label>目标模型:</label>
+                                                    <el-input
+                                                        v-model="mapping.target"
+                                                        placeholder="例如: claude-opus-4-1-20250805"
+                                                        size="small"
+                                                        style="width: 220px;">
+                                                    </el-input>
+                                                </div>
+                                                <div class="mapping-actions-compact">
+                                                    <el-button
+                                                        type="danger"
+                                                        size="small"
+                                                        @click="removeModelMapping('claude', index)">
+                                                        删除
+                                                    </el-button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div class="empty-mapping" v-else>
+                                    <p>暂无映射规则，点击"添加映射"按钮创建第一个规则</p>
+                                </div>
+                            </div>
+                        </el-tab-pane>
+                        
+                        <el-tab-pane label="Codex 模型映射" name="codex">
+                            <div class="mapping-section">
+                                <div class="mapping-header">
+                                    <h4>Codex 模型映射规则</h4>
+                                    <el-button type="primary" size="small" @click="addModelMapping('codex')">
+                                        <i class="el-icon-plus"></i> 添加映射
+                                    </el-button>
+                                </div>
+                                
+                                <div class="mapping-list" v-if="routingConfig.modelMappings.codex.length > 0">
+                                    <div class="mapping-item" v-for="(mapping, index) in routingConfig.modelMappings.codex" :key="index">
+                                        <div class="mapping-form-horizontal">
+                                            <div class="mapping-field-group">
+                                                <div class="mapping-field-compact">
+                                                    <label>源类型:</label>
+                                                    <el-select
+                                                        v-model="mapping.source_type"
+                                                        placeholder="选择类型"
+                                                        size="small"
+                                                        style="width: 80px;">
+                                                        <el-option label="模型" value="model"></el-option>
+                                                        <el-option label="配置" value="config"></el-option>
+                                                    </el-select>
+                                                </div>
+                                                <div class="mapping-field-compact">
+                                                    <label v-if="mapping.source_type === 'model'">源模型:</label>
+                                                    <label v-else>使用配置:</label>
+                                                    <el-select
+                                                        v-if="mapping.source_type === 'config'"
+                                                        v-model="mapping.source"
+                                                        placeholder="选择配置"
+                                                        size="small"
+                                                        style="width: 520px;">
+                                                        <el-option
+                                                            v-for="config in codexConfigs"
+                                                            :key="config"
+                                                            :label="config"
+                                                            :value="config">
+                                                        </el-option>
+                                                    </el-select>
+                                                    <el-input
+                                                        v-else
+                                                        v-model="mapping.source"
+                                                        placeholder="例如: gpt-5-codex"
+                                                        size="small"
+                                                        style="width: 220px;">
+                                                    </el-input>
+                                                </div>
+                                                <div class="mapping-arrow-compact">→</div>
+                                                <div class="mapping-field-compact">
+                                                    <label>目标模型:</label>
+                                                    <el-input
+                                                        v-model="mapping.target"
+                                                        placeholder="例如: gpt-5-codex"
+                                                        size="small"
+                                                        style="width: 220px;">
+                                                    </el-input>
+                                                </div>
+                                                <div class="mapping-actions-compact">
+                                                    <el-button
+                                                        type="danger"
+                                                        size="small"
+                                                        @click="removeModelMapping('codex', index)">
+                                                        删除
+                                                    </el-button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div class="empty-mapping" v-else>
+                                    <p>暂无映射规则，点击"添加映射"按钮创建第一个规则</p>
+                                </div>
+                            </div>
+                        </el-tab-pane>
+                    </el-tabs>
+                </div>
+                
+                <div class="mapping-footer">
+                    <el-button @click="closeModelMappingDrawer">取消</el-button>
+                    <el-button type="primary" @click="saveRoutingConfig" :loading="routingConfigSaving">
+                        保存配置
+                    </el-button>
+                </div>
+            </div>
+        </el-drawer>
+
+        <!-- 模型→配置映射配置抽屉 -->
+        <el-drawer 
+            v-model="configMappingDrawerVisible" 
+            title="模型→配置映射配置" 
+            :size="drawerSizes.configMapping" 
+            direction="rtl"
+            class="mapping-drawer">
+            <div class="mapping-drawer-content">
+                <div class="mapping-tabs">
+                    <el-tabs type="border-card" v-model="activeConfigMappingTab">
+                        <el-tab-pane label="Claude 配置映射" name="claude">
+                            <div class="mapping-section">
+                                <div class="mapping-header">
+                                    <h4>Claude 模型配置映射规则</h4>
+                                    <el-button type="primary" size="small" @click="addConfigMapping('claude')">
+                                        <i class="el-icon-plus"></i> 添加映射
+                                    </el-button>
+                                </div>
+                                
+                                <div class="mapping-list" v-if="routingConfig.configMappings.claude.length > 0">
+                                    <div class="mapping-item" v-for="(mapping, index) in routingConfig.configMappings.claude" :key="index">
+                                        <div class="mapping-form">
+                                            <div class="mapping-field">
+                                                <label>模型名称:</label>
+                                                <el-input 
+                                                    v-model="mapping.model" 
+                                                    placeholder="例如: claude-sonnet-4-20250514"
+                                                    size="small">
+                                                </el-input>
+                                            </div>
+                                            <div class="mapping-arrow">→</div>
+                                            <div class="mapping-field">
+                                                <label>使用配置:</label>
+                                                <el-select 
+                                                    v-model="mapping.config" 
+                                                    placeholder="选择配置"
+                                                    size="small">
+                                                    <el-option 
+                                                        v-for="config in claudeConfigs" 
+                                                        :key="config" 
+                                                        :label="config" 
+                                                        :value="config">
+                                                    </el-option>
+                                                </el-select>
+                                            </div>
+                                            <div class="mapping-actions">
+                                                <el-button 
+                                                    type="danger" 
+                                                    size="small" 
+                                                    @click="removeConfigMapping('claude', index)">
+                                                    删除
+                                                </el-button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div class="empty-mapping" v-else>
+                                    <p>暂无映射规则，点击"添加映射"按钮创建第一个规则</p>
+                                </div>
+                            </div>
+                        </el-tab-pane>
+                        
+                        <el-tab-pane label="Codex 配置映射" name="codex">
+                            <div class="mapping-section">
+                                <div class="mapping-header">
+                                    <h4>Codex 模型配置映射规则</h4>
+                                    <el-button type="primary" size="small" @click="addConfigMapping('codex')">
+                                        <i class="el-icon-plus"></i> 添加映射
+                                    </el-button>
+                                </div>
+                                
+                                <div class="mapping-list" v-if="routingConfig.configMappings.codex.length > 0">
+                                    <div class="mapping-item" v-for="(mapping, index) in routingConfig.configMappings.codex" :key="index">
+                                        <div class="mapping-form">
+                                            <div class="mapping-field">
+                                                <label>模型名称:</label>
+                                                <el-input 
+                                                    v-model="mapping.model" 
+                                                    placeholder="例如: gpt-5-codex"
+                                                    size="small">
+                                                </el-input>
+                                            </div>
+                                            <div class="mapping-arrow">→</div>
+                                            <div class="mapping-field">
+                                                <label>使用配置:</label>
+                                                <el-select 
+                                                    v-model="mapping.config" 
+                                                    placeholder="选择配置"
+                                                    size="small">
+                                                    <el-option 
+                                                        v-for="config in codexConfigs" 
+                                                        :key="config" 
+                                                        :label="config" 
+                                                        :value="config">
+                                                    </el-option>
+                                                </el-select>
+                                            </div>
+                                            <div class="mapping-actions">
+                                                <el-button 
+                                                    type="danger" 
+                                                    size="small" 
+                                                    @click="removeConfigMapping('codex', index)">
+                                                    删除
+                                                </el-button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div class="empty-mapping" v-else>
+                                    <p>暂无映射规则，点击"添加映射"按钮创建第一个规则</p>
+                                </div>
+                            </div>
+                        </el-tab-pane>
+                    </el-tabs>
+                </div>
+                
+                <div class="mapping-footer">
+                    <el-button @click="closeConfigMappingDrawer">取消</el-button>
+                    <el-button type="primary" @click="saveRoutingConfig" :loading="routingConfigSaving">
+                        保存配置
+                    </el-button>
+                </div>
+            </div>
+        </el-drawer>
+
+        <!-- 添加站点分组弹窗 -->
+        <el-dialog
+            v-model="mergedDialogVisible"
+            :title="mergedDialogMode === 'edit' ? '编辑站点分组' : '添加站点分组'"
+            :width="dialogSizes.mergedGroup"
+            :fullscreen="isMobileViewport"
+            @close="cancelMergedDialog">
+
+            <el-form
+                :model="mergedDialogDraft"
+                :label-width="isMobileViewport ? 'auto' : '100px'"
+                :label-position="isMobileViewport ? 'top' : 'right'">
+                <el-form-item label="目标地址:" required>
+                    <el-input
+                        v-model="mergedDialogDraft.baseUrl"
+                        placeholder="https://api.example.com">
+                    </el-input>
+                </el-form-item>
+
+                <el-form-item label="权重:">
+                    <el-input-number
+                        v-model="mergedDialogDraft.weight"
+                        :min="0"
+                        :step="1">
+                    </el-input-number>
+                </el-form-item>
+
+                <el-form-item label="认证方式:">
+                    <el-radio-group v-model="mergedDialogDraft.authType">
+                        <el-radio-button label="auth_token">Auth Token</el-radio-button>
+                        <el-radio-button label="api_key">API Key</el-radio-button>
+                    </el-radio-group>
+                </el-form-item>
+
+                <div class="dialog-entries-container">
+                    <div
+                        v-for="(entry, index) in mergedDialogDraft.entries"
+                        :key="index"
+                        class="dialog-entry-row">
+                        <el-input
+                            v-model="entry.name"
+                            placeholder="站点名称"
+                            :style="isMobileViewport ? {} : { width: '180px' }">
+                        </el-input>
+                        <el-input
+                            v-model="entry.authValue"
+                            placeholder="秘钥"
+                            type="password"
+                            show-password
+                            :style="isMobileViewport ? {} : { width: '280px' }">
+                        </el-input>
+                        <el-switch v-model="entry.active"></el-switch>
+                        <el-button
+                            type="danger"
+                            size="small"
+                            @click="removeDialogEntry(index)">
+                            删除
+                        </el-button>
+                    </div>
+
+                    <el-button
+                        type="success"
+                        size="small"
+                        @click="addDialogEntry"
+                        style="margin-top: 8px;">
+                        <i class="el-icon-plus"></i> 添加秘钥
+                    </el-button>
+                </div>
+            </el-form>
+
+            <template #footer>
+                <el-button @click="cancelMergedDialog">取消</el-button>
+                <el-button
+                    type="primary"
+                    @click="submitMergedDialog"
+                    :loading="configSaving">
+                    {{ mergedDialogMode === 'edit' ? '保存配置' : '确认添加' }}
+                </el-button>
+            </template>
+        </el-dialog>
+    </div>
+
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- Element Plus -->
+    <script src="https://unpkg.com/element-plus@2.8.0/dist/index.full.js"></script>
+    <!-- 实时连接管理器 -->
+    <script src="/static/realtime-manager.js"></script>
+    <!-- 应用逻辑 -->
+    <script src="/static/app.js"></script>
+    
+    <script>
+    // 确保库加载完成后再初始化
+    window.addEventListener('DOMContentLoaded', function() {
+        // 检查Vue和Element Plus是否加载成功
+        if (typeof Vue === 'undefined') {
+            console.error('Vue未加载成功');
+            document.getElementById('app').innerHTML = '<h1>Vue加载失败，请检查网络连接</h1>';
+            return;
+        }
+        
+        if (typeof ElementPlus === 'undefined') {
+            console.error('Element Plus未加载成功');
+            document.getElementById('app').innerHTML = '<h1>Element Plus加载失败，请检查网络连接</h1>';
+            return;
+        }
+        
+        console.log('Vue和Element Plus已加载，app.js应该会自动初始化应用');
+    });
+    </script>
+</body>
+</html>
