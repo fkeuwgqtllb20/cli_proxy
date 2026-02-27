@@ -921,7 +921,9 @@ class BaseProxyService(ABC):
                 lb_result_recorded = True
 
             # 构造返回头，标记被剔除的头信息
-            excluded_response_headers = {}
+            # httpx 的 aiter_bytes() 会自动解压 gzip/deflate/br 响应，
+            # 因此必须剔除这些编码相关的头，否则客户端会尝试二次解压导致 ZlibError
+            excluded_response_headers = {'content-encoding', 'content-length', 'transfer-encoding'}
             response_headers = {}  # 用于实际返回
             response_headers_for_log = {}  # 用于日志记录（包含标记）
 
