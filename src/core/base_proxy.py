@@ -886,7 +886,10 @@ class BaseProxyService(ABC):
             )
 
         except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=500)
+            return JSONResponse({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)}
+            }, status_code=400)
 
         # 应用请求过滤器，放到线程池避免阻塞事件循环
         filtered_body = await asyncio.to_thread(self.apply_request_filter, target_body)
@@ -1030,7 +1033,10 @@ class BaseProxyService(ABC):
             else:
                 error_msg = "请求失败"
 
-            response_data = {"error": error_msg, "detail": str(exc)}
+            response_data = {
+                "type": "error",
+                "error": {"type": "api_error", "message": f"{error_msg}: {exc}"}
+            }
             status_code = 500
 
             # 发送错误事件
