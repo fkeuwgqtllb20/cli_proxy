@@ -83,10 +83,10 @@ const app = createApp({
         const mergedDialogVisible = ref(false);
         const mergedDialogService = ref('');
         const mergedDialogDraft = reactive({
+            groupName: '',
             baseUrl: 'https://',
-            weight: 0,
             authType: 'auth_token',
-            entries: []  // [{ name, authValue, active }]
+            entries: []  // [{ name, authValue, accountId, disabled, active }]
         });
         const mergedDialogMode = ref('add');
         const mergedDialogEditIndex = ref(-1);
@@ -104,16 +104,14 @@ const app = createApp({
                 baseUrl: 'https://',
                 authType: 'auth_token',
                 authValue: '',
-                active: false,
-                weight: 0
+                active: false
             },
             codex: {
                 name: '',
                 baseUrl: 'https://',
                 authType: 'auth_token',
                 authValue: '',
-                active: false,
-                weight: 0
+                active: false
             }
         });
 
@@ -268,7 +266,15 @@ const app = createApp({
 
         // 系统配置
         const systemConfig = reactive({
-            logLimit: 50
+            logLimit: 50,
+            testModels: {
+                claude: [
+                    'claude-opus-4-6',
+                    'claude-sonnet-4-6',
+                    'claude-haiku-4-5-20251001'
+                ],
+                codex: []
+            }
         });
 
         // 请求状态映射
@@ -456,20 +462,8 @@ const app = createApp({
 
         // 获取模型选项
         const getModelOptions = (service) => {
-            if (service === 'claude') {
-                return [
-                    { label: 'claude-sonnet-4-5-20250929', value: 'claude-sonnet-4-5-20250929' },
-                    { label: 'claude-sonnet-4-20250514', value: 'claude-sonnet-4-20250514' },
-                    { label: 'claude-opus-4-20250514', value: 'claude-opus-4-20250514' },
-                    { label: 'claude-opus-4-1-20250805', value: 'claude-opus-4-1-20250805' }
-                ];
-            } else if (service === 'codex') {
-                return [
-                    { label: 'gpt-5-codex', value: 'gpt-5-codex' },
-                    { label: 'gpt-5', value: 'gpt-5' }
-                ];
-            }
-            return [];
+            const models = systemConfig.testModels[service] || [];
+            return models.map(m => ({ label: m, value: m }));
         };
 
         // 测试新增站点连接
@@ -564,7 +558,11 @@ const app = createApp({
                 };
 
                 // 根据认证类型设置认证信息
-                if (siteData.authType === 'auth_token') {
+                if (siteData.authType === 'oauth') {
+                    requestData.auth_token = siteData.authValue;
+                    requestData.account_id = siteData.accountId;
+                    requestData.auth_type = 'oauth';
+                } else if (siteData.authType === 'auth_token') {
                     requestData.auth_token = siteData.authValue;
                 } else {
                     requestData.api_key = siteData.authValue;
@@ -1356,21 +1354,22 @@ const app = createApp({
             }
         };
         
-        // 加载配置选项
+        // 加载配置选项 (v2: 下拉框显示组名)
         const loadConfigOptions = async () => {
             try {
                 // 加载Claude配置选项
                 const claudeData = await fetchWithErrorHandling('/api/config/claude');
                 if (claudeData.content) {
-                    const configs = JSON.parse(claudeData.content);
-                    const entries = Object.entries(configs).filter(([key, value]) => key && key !== 'undefined' && value !== undefined);
-                    claudeConfigs.value = entries.map(([key]) => key);
+                    const raw = JSON.parse(claudeData.content);
+                    const groups = raw.__groups || {};
+                    claudeConfigs.value = Object.keys(groups);
                     const metadata = {};
-                    entries.forEach(([key, value]) => {
-                        const weightValue = Number(value?.weight ?? 0);
-                        metadata[key] = {
-                            weight: Number.isFinite(weightValue) ? weightValue : 0,
-                            active: !!value?.active
+                    Object.entries(groups).forEach(([groupName, groupData]) => {
+                        const keyCount = (groupData.keys || []).length;
+                        metadata[groupName] = {
+                            weight: 0,
+                            active: raw.__active_group === groupName,
+                            keyCount
                         };
                     });
                     configMetadata.claude = metadata;
@@ -1378,19 +1377,20 @@ const app = createApp({
                     claudeConfigs.value = [];
                     configMetadata.claude = {};
                 }
-                
+
                 // 加载Codex配置选项
                 const codexData = await fetchWithErrorHandling('/api/config/codex');
                 if (codexData.content) {
-                    const configs = JSON.parse(codexData.content);
-                    const entries = Object.entries(configs).filter(([key, value]) => key && key !== 'undefined' && value !== undefined);
-                    codexConfigs.value = entries.map(([key]) => key);
+                    const raw = JSON.parse(codexData.content);
+                    const groups = raw.__groups || {};
+                    codexConfigs.value = Object.keys(groups);
                     const metadata = {};
-                    entries.forEach(([key, value]) => {
-                        const weightValue = Number(value?.weight ?? 0);
-                        metadata[key] = {
-                            weight: Number.isFinite(weightValue) ? weightValue : 0,
-                            active: !!value?.active
+                    Object.entries(groups).forEach(([groupName, groupData]) => {
+                        const keyCount = (groupData.keys || []).length;
+                        metadata[groupName] = {
+                            weight: 0,
+                            active: raw.__active_group === groupName,
+                            keyCount
                         };
                     });
                     configMetadata.codex = metadata;
@@ -1489,12 +1489,14 @@ const app = createApp({
                 const claudeContent = claudeData?.content ?? '{}';
                 configContents.claude = claudeContent.trim() ? claudeContent : '{}';
                 syncJsonToForm('claude');
+                buildMergedFromFriendly('claude');
 
                 // 加载Codex配置
                 const codexData = await fetchWithErrorHandling('/api/config/codex');
                 const codexContent = codexData?.content ?? '{}';
                 configContents.codex = codexContent.trim() ? codexContent : '{}';
                 syncJsonToForm('codex');
+                buildMergedFromFriendly('codex');
             } catch (error) {
                 const errorMsg = '// 加载失败: ' + error.message;
                 configContents.claude = errorMsg;
@@ -1513,8 +1515,7 @@ const app = createApp({
                 baseUrl: 'https://',
                 authType: 'auth_token',
                 authValue: '',
-                active: false,
-                weight: 0
+                active: false
             };
             // 自动聚焦到站点名称输入框
             nextTick(() => {
@@ -1555,8 +1556,7 @@ const app = createApp({
                 baseUrl: 'https://',
                 authType: 'auth_token',
                 authValue: '',
-                active: false,
-                weight: 0
+                active: false
             };
         };
 
@@ -1593,64 +1593,85 @@ const app = createApp({
         };
 
         // 处理激活状态变化（单选逻辑）
-        const handleActiveChange = (service, activeIndex, newValue) => {
-            if (newValue) {
-                // 如果激活当前站点，关闭其他站点
-                friendlyConfigs[service].forEach((site, index) => {
-                    if (index !== activeIndex) {
-                        site.active = false;
-                    }
-                });
-            } else {
-                friendlyConfigs[service][activeIndex].active = false;
-            }
-            sortFriendlyList(service);
-            syncFormToJson(service);
-        };
-
         // 从表单同步到JSON
         const syncFormToJson = (service) => {
             if (syncInProgress.value) return;
 
             try {
                 syncInProgress.value = true;
-                sortFriendlyList(service);
-                const jsonObj = {};
-                friendlyConfigs[service].forEach(site => {
-                    if (site.name && site.name.trim()) {
-                        const config = {
-                            base_url: site.baseUrl || '',
-                            active: site.active || false
-                        };
+                // 注意：不在此处调用 sortFriendlyList，避免编辑过程中数组重排导致 Vue 绑定错位
 
-                        // 根据认证类型设置相应字段
-                        if (site.authType === 'auth_token') {
-                            config.auth_token = site.authValue || '';
-                            config.api_key = '';
-                        } else {
-                            config.api_key = site.authValue || '';
-                            config.auth_token = '';
-                        }
+                // 先从 friendlyConfigs 重建 mergedConfigs，确保数据一致
+                buildMergedFromFriendly(service);
 
-                        const weightValue = Number(site.weight ?? 0);
-                        config.weight = Number.isFinite(weightValue) ? weightValue : 0;
+                // 从 mergedConfigs 构建 v2 JSON
+                const merged = mergedConfigs[service] || [];
+                const groups = {};
 
-                        jsonObj[site.name.trim()] = config;
+                // 检测当前活跃组 (从已有JSON中读取, 或取第一个)
+                let currentContent = configContents[service];
+                let currentActiveGroup = null;
+                let currentRotation = { idle_timeout: 300 };
+                try {
+                    if (currentContent) {
+                        const parsed = JSON.parse(currentContent);
+                        currentActiveGroup = parsed.__active_group || null;
+                        currentRotation = parsed.__rotation || { idle_timeout: 300 };
                     }
+                } catch (e) { /* ignore */ }
+
+                merged.forEach(group => {
+                    if (!group.groupName || !group.groupName.trim()) return;
+                    const gName = group.groupName.trim();
+                    const keys = [];
+                    (group.entries || []).forEach(entry => {
+                        if (!entry.name || !entry.name.trim()) return;
+                        const keyObj = {
+                            name: entry.name.trim(),
+                            auth_token: '',
+                            disabled: entry.disabled || false
+                        };
+                        if (group.authType === 'oauth') {
+                            keyObj.auth_token = entry.authValue || '';
+                            keyObj.account_id = entry.accountId || '';
+                        } else if (group.authType === 'api_key') {
+                            keyObj.api_key = entry.authValue || '';
+                        } else {
+                            keyObj.auth_token = entry.authValue || '';
+                        }
+                        keys.push(keyObj);
+                    });
+                    groups[gName] = {
+                        base_url: group.baseUrl || '',
+                        auth_type: group.authType || 'auth_token',
+                        keys
+                    };
                 });
 
-                configContents[service] = JSON.stringify(jsonObj, null, 2);
+                // 确保 active_group 仍然有效
+                if (!currentActiveGroup || !groups[currentActiveGroup]) {
+                    const groupNames = Object.keys(groups);
+                    currentActiveGroup = groupNames.length > 0 ? groupNames[0] : null;
+                }
+
+                const v2 = {
+                    __version: 2,
+                    __active_group: currentActiveGroup,
+                    __rotation: currentRotation,
+                    __groups: groups
+                };
+
+                configContents[service] = JSON.stringify(v2, null, 2);
             } catch (error) {
                 console.error('同步表单到JSON失败:', error);
             } finally {
-                // 延迟重置状态，确保watch不会立即触发
                 nextTick(() => {
                     syncInProgress.value = false;
                 });
             }
         };
 
-        // 从JSON同步到表单
+        // 从JSON同步到表单 (v2 组格式)
         const syncJsonToForm = (service) => {
             if (syncInProgress.value) return;
 
@@ -1662,47 +1683,42 @@ const app = createApp({
                     return;
                 }
 
-                const jsonObj = JSON.parse(content);
+                const raw = JSON.parse(content);
+                const groups = raw.__groups || {};
                 const sites = [];
 
-                Object.entries(jsonObj).forEach(([siteName, config]) => {
-                    if (config && typeof config === 'object') {
-                        // 判断使用哪种认证方式
-                        let authType = 'auth_token';
+                Object.entries(groups).forEach(([groupName, groupData]) => {
+                    const baseUrl = groupData.base_url || '';
+                    const authType = groupData.auth_type || 'auth_token';
+                    const keys = groupData.keys || [];
+
+                    keys.forEach(keyEntry => {
                         let authValue = '';
-
-                        if (config.api_key && config.api_key.trim()) {
-                            authType = 'api_key';
-                            authValue = config.api_key;
-                        } else if (config.auth_token) {
-                            authType = 'auth_token';
-                            authValue = config.auth_token;
-                        }
-
-                        let weightValue = Number(config.weight ?? 0);
-                        if (!Number.isFinite(weightValue)) {
-                            weightValue = 0;
+                        if (authType === 'api_key') {
+                            authValue = keyEntry.api_key || '';
+                        } else {
+                            authValue = keyEntry.auth_token || '';
                         }
 
                         sites.push({
-                            name: siteName,
-                            baseUrl: config.base_url || '',
-                            authType: authType,
-                            authValue: authValue,
-                            active: config.active || false,
-                            weight: weightValue,
+                            name: keyEntry.name || '',
+                            baseUrl,
+                            authType,
+                            authValue,
+                            accountId: keyEntry.account_id || '',
+                            active: false,
+                            groupName,
+                            disabled: keyEntry.disabled || false,
                             __mergedId: generateEntryId()
                         });
-                    }
+                    });
                 });
 
                 friendlyConfigs[service] = sites;
                 sortFriendlyList(service);
             } catch (error) {
                 console.error('同步JSON到表单失败:', error);
-                // JSON解析失败时保持现有表单数据不变
             } finally {
-                // 延迟重置状态
                 nextTick(() => {
                     syncInProgress.value = false;
                 });
@@ -1742,11 +1758,6 @@ const app = createApp({
 
         const normalizeValue = (value) => (value ?? '').toString().trim();
 
-        const getWeightValue = (value) => {
-            const num = Number(value);
-            return Number.isFinite(num) ? num : 0;
-        };
-
         const compareByName = (left, right) => (
             normalizeValue(left).localeCompare(normalizeValue(right), 'zh-Hans-CN')
         );
@@ -1762,21 +1773,16 @@ const app = createApp({
 
         const sortFriendlyList = (service) => {
             friendlyConfigs[service].sort((a, b) => {
-                if (a.active !== b.active) {
-                    return a.active ? -1 : 1;
+                // 按组名分组
+                const groupCompare = compareByName(a.groupName || '', b.groupName || '');
+                if (groupCompare !== 0) return groupCompare;
+
+                // 非禁用的排前面
+                if (a.disabled !== b.disabled) {
+                    return a.disabled ? 1 : -1;
                 }
 
-                const weightDiff = getWeightValue(b.weight) - getWeightValue(a.weight);
-                if (weightDiff !== 0) {
-                    return weightDiff;
-                }
-
-                const nameCompare = compareByName(a.name, b.name);
-                if (nameCompare !== 0) {
-                    return nameCompare;
-                }
-
-                return compareByName(a.baseUrl, b.baseUrl);
+                return compareByName(a.name, b.name);
             });
         };
 
@@ -1788,42 +1794,26 @@ const app = createApp({
             });
 
             mergedConfigs[service].sort((a, b) => {
-                const aActive = Array.isArray(a.entries) && a.entries.some(entry => entry.active);
-                const bActive = Array.isArray(b.entries) && b.entries.some(entry => entry.active);
-
-                if (aActive !== bActive) {
-                    return aActive ? -1 : 1;
+                if (a.isActive !== b.isActive) {
+                    return a.isActive ? -1 : 1;
                 }
 
-                const weightDiff = getWeightValue(b.weight) - getWeightValue(a.weight);
-                if (weightDiff !== 0) {
-                    return weightDiff;
-                }
-
-                return compareByName(a.baseUrl, b.baseUrl);
+                return compareByName(a.groupName, b.groupName);
             });
         };
 
         /**
-         * 检测并统一组内的权重和认证方式
+         * 检测并统一组内的认证方式
          * 返回不一致的字段列表
          */
         const normalizeGroupValues = (service, group) => {
             const inconsistent = [];
-            const standardWeight = group.weight;
             const standardAuthType = group.authType;
 
             group.entries.forEach(entry => {
-                // 在 friendlyConfigs 中找到对应项并修正
                 const friendlyItem = findFriendlyBySiteId(service, entry.siteId);
 
                 if (friendlyItem) {
-                    if (friendlyItem.weight !== standardWeight) {
-                        if (!inconsistent.includes('权重')) {
-                            inconsistent.push('权重');
-                        }
-                        friendlyItem.weight = standardWeight;
-                    }
                     if (friendlyItem.authType !== standardAuthType) {
                         if (!inconsistent.includes('认证方式')) {
                             inconsistent.push('认证方式');
@@ -1833,7 +1823,6 @@ const app = createApp({
                 }
             });
 
-            // 如果修正了数据，同步到 JSON
             if (inconsistent.length > 0) {
                 syncFormToJson(service);
             }
@@ -1845,30 +1834,30 @@ const app = createApp({
          * 判断分组内是否存在激活秘钥
          */
         const isMergedGroupActive = (group) => (
-            group && Array.isArray(group.entries) && group.entries.some(entry => entry.active)
+            group && group.isActive === true
         );
 
         /**
-         * 从交互模式配置构建合并视图
+         * 从交互模式配置构建合并视图 (v2: 按 groupName 分组)
          */
         const buildMergedFromFriendly = (service) => {
             const friendly = friendlyConfigs[service];
-            const grouped = new Map(); // baseUrl -> group对象
+            const grouped = new Map(); // groupName -> group对象
 
-            sortFriendlyList(service);
-
-            // 第一步：按 baseUrl 分组
+            // 注意：不在此处排序，避免用户操作时数组重排导致 Vue 绑定错位
+            // 按 groupName 分组
             friendly.forEach((site, idx) => {
-                if (!site.baseUrl || !site.baseUrl.trim()) {
-                    console.warn(`站点 ${site.name} 缺少 base_url`);
+                const gName = site.groupName || site.baseUrl || '';
+                if (!gName.trim()) {
+                    console.warn(`站点 ${site.name} 缺少 groupName`);
                     return;
                 }
 
-                const key = site.baseUrl.trim();
+                const key = gName.trim();
                 if (!grouped.has(key)) {
                     grouped.set(key, {
-                        baseUrl: key,
-                        weight: site.weight || 0,
+                        groupName: key,
+                        baseUrl: site.baseUrl || '',
                         authType: site.authType || 'auth_token',
                         entries: []
                     });
@@ -1880,6 +1869,8 @@ const app = createApp({
                 group.entries.push({
                     name: site.name,
                     authValue: site.authValue || '',
+                    accountId: site.accountId || '',
+                    disabled: site.disabled || false,
                     active: site.active || false,
                     derivedId: site.__mergedId || `${site.name}_${idx}`,
                     siteId,
@@ -1887,24 +1878,17 @@ const app = createApp({
                 });
             });
 
-            // 第二步：检测并统一组内的 weight 和 authType
-            grouped.forEach((group, baseUrl) => {
-                const inconsistent = normalizeGroupValues(service, group);
-                if (inconsistent.length > 0) {
-                    ElMessage.warning(
-                        `站点组 ${baseUrl} 内存在不一致的${inconsistent.join('、')}，已自动统一为第一条配置`
-                    );
-                }
-            });
-
-            // 第三步：更新 mergedConfigs
+            // 更新 mergedConfigs
+            const activeGroupName = services[service].config;
             mergedConfigs[service] = Array.from(grouped.values());
+            mergedConfigs[service].forEach(group => {
+                group.isActive = group.groupName === activeGroupName;
+            });
             sortMergedGroups(service);
         };
 
         /**
          * 从合并视图重建交互模式配置
-         * 用于保存前的数据校验和重建
          */
         const rebuildFriendlyFromMerged = (service) => {
             const merged = mergedConfigs[service];
@@ -1918,9 +1902,11 @@ const app = createApp({
                     newFriendly.push({
                         name: entry.name,
                         baseUrl: group.baseUrl,
-                        weight: group.weight,
+                        groupName: group.groupName,
                         authType: group.authType,
                         authValue: entry.authValue,
+                        accountId: entry.accountId || '',
+                        disabled: entry.disabled || false,
                         active: entry.active,
                         __mergedId: siteId
                     });
@@ -1933,7 +1919,7 @@ const app = createApp({
         };
 
         /**
-         * 应用分组级修改（权重、认证方式、base_url）
+         * 应用分组级修改（认证方式、base_url）
          */
         const applyMergedGroupUpdate = (service, groupIndex) => {
             const group = mergedConfigs[service][groupIndex];
@@ -1950,7 +1936,6 @@ const app = createApp({
 
                 if (friendlyItem) {
                     friendlyItem.baseUrl = group.baseUrl;
-                    friendlyItem.weight = group.weight;
                     friendlyItem.authType = group.authType;
                 }
             });
@@ -2127,9 +2112,10 @@ const app = createApp({
             friendlyConfigs[service].push({
                 name: newEntry.name,
                 baseUrl: group.baseUrl,
-                weight: group.weight,
+                groupName: group.groupName,
                 authType: group.authType,
                 authValue: '',
+                accountId: '',
                 active: false,
                 __mergedId: newSiteId
             });
@@ -2180,7 +2166,7 @@ const app = createApp({
             const group = mergedConfigs[service][groupIndex];
 
             ElMessageBox.confirm(
-                `确定要删除站点组 "${group.baseUrl}" 及其下所有 ${group.entries.length} 个秘钥吗？`,
+                `确定要删除站点组 "${group.groupName}" 及其下所有 ${group.entries.length} 个秘钥吗？`,
                 '提示',
                 { type: 'warning' }
             ).then(async () => {
@@ -2226,13 +2212,7 @@ const app = createApp({
             for (const group of mergedConfigs[service]) {
                 // 校验 baseUrl
                 if (!isValidUrl(group.baseUrl)) {
-                    ElMessage.error(`站点组 ${group.baseUrl} 的地址格式不正确`);
-                    return;
-                }
-
-                // 校验权重
-                if (!Number.isFinite(group.weight) || group.weight < 0) {
-                    ElMessage.error(`站点组 ${group.baseUrl} 的权重必须为非负整数`);
+                    ElMessage.error(`站点组 "${group.groupName}" 的地址格式不正确`);
                     return;
                 }
 
@@ -2242,7 +2222,7 @@ const app = createApp({
                 );
                 if (invalidEntries.length > 0) {
                     ElMessage.error(
-                        `站点组 ${group.baseUrl} 中有秘钥未填写：${invalidEntries.map(e => e.name).join(', ')}`
+                        `站点组 "${group.groupName}" 中有秘钥未填写：${invalidEntries.map(e => e.name).join(', ')}`
                     );
                     return;
                 }
@@ -2262,11 +2242,11 @@ const app = createApp({
             mergedDialogService.value = service;
             mergedDialogMode.value = 'add';
             mergedDialogEditIndex.value = -1;
+            mergedDialogDraft.groupName = '';
             mergedDialogDraft.baseUrl = 'https://';
-            mergedDialogDraft.weight = 0;
             mergedDialogDraft.authType = 'auth_token';
             mergedDialogDraft.entries = [
-                { name: '', authValue: '', active: false, siteId: null, lastSyncedName: '' }
+                { name: '', authValue: '', accountId: '', disabled: false, active: false, siteId: null, lastSyncedName: '' }
             ];
             mergedDialogVisible.value = true;
         };
@@ -2285,18 +2265,20 @@ const app = createApp({
             mergedDialogMode.value = 'edit';
             mergedDialogEditIndex.value = groupIndex;
 
+            mergedDialogDraft.groupName = group.groupName || '';
             mergedDialogDraft.baseUrl = group.baseUrl;
-            mergedDialogDraft.weight = group.weight;
             mergedDialogDraft.authType = group.authType;
             mergedDialogDraft.entries = group.entries.length > 0
                 ? group.entries.map(entry => ({
                     name: entry.name,
                     authValue: entry.authValue,
+                    accountId: entry.accountId || '',
+                    disabled: entry.disabled || false,
                     active: entry.active,
                     siteId: entry.siteId || null,
                     lastSyncedName: entry.lastSyncedName || entry.name
                 }))
-                : [{ name: '', authValue: '', active: false, siteId: null, lastSyncedName: '' }];
+                : [{ name: '', authValue: '', accountId: '', disabled: false, active: false, siteId: null, lastSyncedName: '' }];
 
             sortEntryList(mergedDialogDraft.entries);
 
@@ -2310,6 +2292,8 @@ const app = createApp({
             mergedDialogDraft.entries.push({
                 name: '',
                 authValue: '',
+                accountId: '',
+                disabled: false,
                 active: false,
                 siteId: null,
                 lastSyncedName: ''
@@ -2349,13 +2333,13 @@ const app = createApp({
                 return;
             }
 
-            if (!isValidUrl(draft.baseUrl)) {
-                ElMessage.error('目标地址格式不正确，请输入有效的 HTTP/HTTPS URL');
+            if (!draft.groupName || !draft.groupName.trim()) {
+                ElMessage.error('组名不能为空');
                 return;
             }
 
-            if (!Number.isFinite(draft.weight) || draft.weight < 0) {
-                ElMessage.error('权重必须为非负整数');
+            if (!isValidUrl(draft.baseUrl)) {
+                ElMessage.error('目标地址格式不正确，请输入有效的 HTTP/HTTPS URL');
                 return;
             }
 
@@ -2394,38 +2378,7 @@ const app = createApp({
                     .filter(Boolean)
             );
 
-            const existingNames = friendlyConfigs[service]
-                .filter(site => !entrySiteIds.has(site.__mergedId))
-                .map(site => site.name);
-
-            const duplicateEntries = draft.entries.filter(entry => existingNames.includes(entry.name));
-            if (duplicateEntries.length > 0) {
-                try {
-                    await ElMessageBox.confirm(
-                        `检测到重复的站点名称：${duplicateEntries.map(e => e.name).join(', ')}。是否自动追加后缀？`,
-                        '提示',
-                        { type: 'warning' }
-                    );
-
-                    duplicateEntries.forEach(entry => {
-                        let suffix = 1;
-                        let newName = `${entry.name}-${suffix}`;
-                        while (
-                            existingNames.includes(newName) ||
-                            draft.entries.some(other => other !== entry && other.name === newName)
-                        ) {
-                            suffix++;
-                            newName = `${entry.name}-${suffix}`;
-                        }
-                        existingNames.push(newName);
-                        entry.name = newName;
-                        entry.lastSyncedName = newName;
-                    });
-
-                } catch {
-                    return;
-                }
-            }
+            // v2 格式中 key 名只需组内唯一，不做跨组重名检查
 
             let activeEntry = null;
             draft.entries.forEach(entry => {
@@ -2437,6 +2390,13 @@ const app = createApp({
             });
 
             if (mode === 'add') {
+                // 检查组名是否已存在
+                const existingGroupNames = (mergedConfigs[service] || []).map(g => g.groupName);
+                if (existingGroupNames.includes(draft.groupName.trim())) {
+                    ElMessage.error(`组名 "${draft.groupName.trim()}" 已存在`);
+                    return;
+                }
+
                 const newSites = draft.entries.map(entry => {
                     const siteId = generateEntryId();
                     entry.siteId = siteId;
@@ -2444,9 +2404,11 @@ const app = createApp({
                     return {
                         name: entry.name,
                         baseUrl: draft.baseUrl,
-                        weight: draft.weight,
+                        groupName: draft.groupName.trim(),
                         authType: draft.authType,
                         authValue: entry.authValue,
+                        accountId: entry.accountId || '',
+                        disabled: entry.disabled || false,
                         active: entry.active,
                         __mergedId: siteId
                     };
@@ -2487,9 +2449,11 @@ const app = createApp({
                         if (friendlyItem) {
                             friendlyItem.name = entry.name;
                             friendlyItem.baseUrl = draft.baseUrl;
-                            friendlyItem.weight = draft.weight;
+                            friendlyItem.groupName = draft.groupName.trim();
                             friendlyItem.authType = draft.authType;
                             friendlyItem.authValue = entry.authValue;
+                            friendlyItem.accountId = entry.accountId || '';
+                            friendlyItem.disabled = entry.disabled || false;
                             friendlyItem.active = entry.active;
                             friendlyItem.__mergedId = entry.siteId;
                         }
@@ -2500,9 +2464,10 @@ const app = createApp({
                             friendlyConfigs[service].push({
                                 name: entry.name,
                                 baseUrl: draft.baseUrl,
-                                weight: draft.weight,
+                                groupName: draft.groupName.trim(),
                                 authType: draft.authType,
                                 authValue: entry.authValue,
+                                accountId: entry.accountId || '',
                                 active: entry.active,
                                 __mergedId: newSiteId
                             });
@@ -3276,6 +3241,10 @@ const app = createApp({
                 const data = await fetchWithErrorHandling('/api/system/config');
                 if (data.config) {
                     systemConfig.logLimit = data.config.logLimit || 50;
+                    if (data.config.testModels) {
+                        systemConfig.testModels.claude = data.config.testModels.claude || [];
+                        systemConfig.testModels.codex = data.config.testModels.codex || [];
+                    }
                 }
             } catch (error) {
                 console.error('加载系统配置失败:', error);
@@ -3294,7 +3263,7 @@ const app = createApp({
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({ logLimit: newLimit })
+                    body: JSON.stringify({ logLimit: newLimit, testModels: systemConfig.testModels })
                 });
 
                 const result = await response.json();
@@ -3315,6 +3284,41 @@ const app = createApp({
             }
         };
         
+        // 新增测试模型输入框内容
+        const newTestModelInput = reactive({ claude: '', codex: '' });
+
+        const addTestModel = (service) => {
+            const val = (newTestModelInput[service] || '').trim();
+            if (!val) return;
+            if (!systemConfig.testModels[service].includes(val)) {
+                systemConfig.testModels[service].push(val);
+            }
+            newTestModelInput[service] = '';
+        };
+
+        const removeTestModel = (service, model) => {
+            const idx = systemConfig.testModels[service].indexOf(model);
+            if (idx !== -1) systemConfig.testModels[service].splice(idx, 1);
+        };
+
+        const saveTestModels = async (service) => {
+            try {
+                const response = await fetch('/api/system/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        logLimit: systemConfig.logLimit,
+                        testModels: systemConfig.testModels
+                    })
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || '保存失败');
+                ElMessage.success('模型列表已保存');
+            } catch (error) {
+                ElMessage.error('保存失败: ' + error.message);
+            }
+        };
+
         // 格式化请求体JSON
         const formatJsonContent = (bodyRef) => {
             if (!bodyRef.value) {
@@ -3404,11 +3408,11 @@ const app = createApp({
         // 添加对JSON内容变化的监听，实现JSON到表单的同步
         // 监听Claude配置JSON变化
         watch(() => configContents.claude, (newValue) => {
-            // 延迟执行，避免在同步过程中产生循环调用
+            // 只在 JSON 编辑模式下才需要反向同步到表单
+            // 交互/合并模式下 configContents 是由表单驱动的，不能再触发 syncJsonToForm 形成循环
             nextTick(() => {
-                syncJsonToForm('claude');
-                // JSON变化后更新合并视图
-                if (configEditMode.value === 'merged') {
+                if (configEditMode.value === 'json') {
+                    syncJsonToForm('claude');
                     buildMergedFromFriendly('claude');
                 }
             });
@@ -3416,11 +3420,9 @@ const app = createApp({
 
         // 监听Codex配置JSON变化
         watch(() => configContents.codex, (newValue) => {
-            // 延迟执行，避免在同步过程中产生循环调用
             nextTick(() => {
-                syncJsonToForm('codex');
-                // JSON变化后更新合并视图
-                if (configEditMode.value === 'merged') {
+                if (configEditMode.value === 'json') {
+                    syncJsonToForm('codex');
                     buildMergedFromFriendly('codex');
                 }
             });
@@ -3428,9 +3430,13 @@ const app = createApp({
 
         // 监听配置编辑模式变化
         watch(() => configEditMode.value, (newMode, oldMode) => {
+            const tab = activeConfigTab.value;
+            if (oldMode === 'json') {
+                // 从 JSON 模式切出时，用最新 JSON 更新表单
+                syncJsonToForm(tab);
+            }
             if (newMode === 'merged') {
-                // 进入合并模式：从 friendlyConfigs 构建
-                buildMergedFromFriendly(activeConfigTab.value);
+                buildMergedFromFriendly(tab);
             }
         });
 
@@ -3672,6 +3678,7 @@ const app = createApp({
             allLogs,
             claudeConfigs,
             codexConfigs,
+            configMetadata,
             configDrawerVisible,
             filterDrawerVisible,
             logDetailVisible,
@@ -3763,7 +3770,6 @@ const app = createApp({
             cancelAddSite,
             saveInteractiveConfig,
             removeConfigSite,
-            handleActiveChange,
             syncFormToJson,
             syncJsonToForm,
             // 合并模式相关方法
@@ -3789,8 +3795,13 @@ const app = createApp({
             cancelMergedDialog,
             submitMergedDialog,
             getModelOptions,
+            newTestModelInput,
+            addTestModel,
+            removeTestModel,
+            saveTestModels,
             testNewSiteConnection,
             testSiteConnection,
+            ensureEntryId,
             showModelSelector,
             cancelModelSelection,
             confirmModelSelection,

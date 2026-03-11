@@ -83,6 +83,10 @@ class BaseProxyService(ABC):
         # 响应日志截断阈值（避免长流占用过多内存）
         self.max_logged_response_bytes = 1024 * 1024  # 1MB
 
+        # 组内 key 轮转状态 (纯内存, 不持久化)
+        # {group_name: {'index': int, 'last_time': float}}
+        self._rotation_state: Dict[str, Dict[str, Any]] = {}
+
         # 初始化实时事件中心
         self.realtime_hub = RealTimeRequestHub(service_name)
 
@@ -663,9 +667,8 @@ class BaseProxyService(ABC):
         return original_body, None
 
     def _get_current_active_config(self) -> Optional[str]:
-        """获取当前激活的配置名（考虑负载均衡）"""
-        configs = self.config_manager.configs
-        return self._select_config_by_loadbalance(configs)
+        """获取当前激活的组名"""
+        return self.config_manager.active_group
 
     def _select_config_by_loadbalance(self, configs: Dict[str, Dict[str, Any]]) -> Optional[str]:
         """根据负载均衡策略选择配置名"""
@@ -775,45 +778,83 @@ class BaseProxyService(ABC):
         if changed:
             self._persist_lb_config()
 
+    def _select_key_from_group(self, group_name: str, group_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        从组中选择一个 key，基于空闲超时轮转策略:
+        - 距上次请求未超过 idle_timeout → 继续使用当前 key (保住缓存)
+        - 超过 idle_timeout → 轮转到下一个 key
+        """
+        keys = [k for k in group_data.get('keys', []) if not k.get('disabled', False)]
+        if not keys:
+            return None
+        if len(keys) == 1:
+            return keys[0]
+
+        now = time.time()
+        idle_timeout = self.config_manager.rotation_config.get('idle_timeout', 300)
+        state = self._rotation_state.get(group_name)
+
+        if state is None:
+            # 首次请求
+            self._rotation_state[group_name] = {'index': 0, 'last_time': now}
+            return keys[0]
+
+        if now - state['last_time'] > idle_timeout:
+            # 空闲超时，轮转到下一个
+            new_index = (state['index'] + 1) % len(keys)
+            self._rotation_state[group_name] = {'index': new_index, 'last_time': now}
+            return keys[new_index]
+        else:
+            # 未超时，继续使用当前 key
+            state['last_time'] = now
+            index = state['index'] % len(keys)
+            return keys[index]
+
     def build_target_param(self, path: str, request: Request, body: bytes) -> Tuple[str, Dict, bytes, Optional[str]]:
         """
-        构建请求参数
+        构建请求参数 (v2 组格式)
 
         Returns:
-            (target_url, headers, body, active_config_name)
+            (target_url, headers, body, key_name_for_logging)
         """
         # 使用最新的路由配置
         self._ensure_routing_config_current()
 
-        # 应用模型路由规则
+        # 应用模型路由规则 (config_override 现在是组名)
         modified_body, config_override = self._apply_model_routing(body)
 
-        # 预加载配置列表，减少重复 I/O
-        configs = self.config_manager.configs
+        # 确定要使用的组
+        groups = self.config_manager.groups
 
-        # 确定要使用的配置
-        if config_override:
-            active_config_name = config_override
+        if config_override and config_override in groups:
+            group_name = config_override
         else:
-            active_config_name = self._select_config_by_loadbalance(configs)
+            group_name = self.config_manager.active_group
 
-        config_data = configs.get(active_config_name)
-        if not config_data and active_config_name:
-            # 配置字典可能因缓存过期，需要重新获取
-            configs = self.config_manager.configs
-            config_data = configs.get(active_config_name)
+        group_data = groups.get(group_name) if group_name else None
 
-        if not config_data:
-            fallback_name = self.config_manager.active_config
-            configs = self.config_manager.configs
-            config_data = configs.get(fallback_name)
-            active_config_name = fallback_name
+        if not group_data and group_name:
+            # 缓存可能过期，刷新重试
+            groups = self.config_manager.groups
+            group_data = groups.get(group_name)
 
-        if not config_data:
-            raise ValueError(f"未找到激活配置: {active_config_name}")
-        
+        if not group_data:
+            # 回退到第一个可用组
+            if groups:
+                group_name = next(iter(groups))
+                group_data = groups[group_name]
+            else:
+                raise ValueError(f"未找到任何可用配置组")
+
+        # 从组中选择一个 key (轮转)
+        key_data = self._select_key_from_group(group_name, group_data)
+        if not key_data:
+            raise ValueError(f"组 {group_name} 中没有可用的 key")
+
+        key_name = key_data.get('name', group_name)
+
         # 构建目标URL
-        base_url = config_data['base_url'].rstrip('/')
+        base_url = group_data['base_url'].rstrip('/')
         normalized_path = path.lstrip('/')
         target_url = f"{base_url}/{normalized_path}" if normalized_path else base_url
 
@@ -821,17 +862,25 @@ class BaseProxyService(ABC):
         if raw_query:
             target_url = f"{target_url}?{raw_query}"
 
-        # 处理headers，排除会被重新设置的头
+        # 处理headers
         excluded_headers = {'x-api-key', 'authorization', 'host', 'content-length'}
         headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded_headers}
         headers['host'] = urlsplit(target_url).netloc
         headers.setdefault('connection', 'keep-alive')
-        if config_data.get('api_key'):
-            headers['x-api-key'] = config_data['api_key']
-        if config_data.get('auth_token'):
-            headers['authorization'] = f'Bearer {config_data["auth_token"]}'
 
-        return target_url, headers, modified_body, active_config_name
+        if key_data.get('api_key'):
+            headers['x-api-key'] = key_data['api_key']
+        if key_data.get('auth_token'):
+            clean_token = ''.join(key_data['auth_token'].split())
+            headers['authorization'] = f'Bearer {clean_token}'
+
+        # OAuth 认证
+        if group_data.get('auth_type') == 'oauth':
+            headers['originator'] = 'codex_cli_rs'
+            if key_data.get('account_id'):
+                headers['chatgpt-account-id'] = key_data['account_id']
+
+        return target_url, headers, modified_body, key_name
 
     @abstractmethod
     def test_endpoint(self, model: str, base_url: str, auth_token: str = None, api_key: str = None, extra_params: dict = None) -> dict:
@@ -1024,37 +1073,49 @@ class BaseProxyService(ABC):
                     final_duration = int((time.time() - start_time) * 1000)
 
                     # 发送请求完成事件
-                    await self.realtime_hub.request_completed(
-                        request_id=request_id,
-                        status_code=status_code,
-                        duration_ms=final_duration,
-                        success=200 <= status_code < 400
-                    )
+                    try:
+                        await self.realtime_hub.request_completed(
+                            request_id=request_id,
+                            status_code=status_code,
+                            duration_ms=final_duration,
+                            success=200 <= status_code < 400
+                        )
+                    except Exception:
+                        pass
 
-                    await response.aclose()
+                    try:
+                        await response.aclose()
+                    except Exception:
+                        pass
 
                     # 原有日志记录逻辑
-                    response_content = bytes(collected) if collected else None
-                    await self.log_request(
-                        method=request.method,
-                        path=path,
-                        status_code=status_code,
-                        duration_ms=final_duration,
-                        target_headers=target_headers,
-                        filtered_body=filtered_body,
-                        original_headers=original_headers,
-                        original_body=original_body,
-                        response_content=response_content,
-                        channel=active_config_name,
-                        response_truncated=response_truncated,
-                        total_response_bytes=total_response_bytes,
-                        target_url=target_url,
-                        response_headers=response_headers_for_log,
-                    )
+                    try:
+                        response_content = bytes(collected) if collected else None
+                        await self.log_request(
+                            method=request.method,
+                            path=path,
+                            status_code=status_code,
+                            duration_ms=final_duration,
+                            target_headers=target_headers,
+                            filtered_body=filtered_body,
+                            original_headers=original_headers,
+                            original_body=original_body,
+                            response_content=response_content,
+                            channel=active_config_name,
+                            response_truncated=response_truncated,
+                            total_response_bytes=total_response_bytes,
+                            target_url=target_url,
+                            response_headers=response_headers_for_log,
+                        )
+                    except Exception as log_exc:
+                        print(f"流式响应日志记录异常: {log_exc}")
 
                     if not lb_result_recorded:
-                        await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
-                        lb_result_recorded = True
+                        try:
+                            await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
+                            lb_result_recorded = True
+                        except Exception:
+                            pass
 
             return StreamingResponse(
                 iterator(),

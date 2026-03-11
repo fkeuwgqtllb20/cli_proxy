@@ -1,217 +1,318 @@
 #!/usr/bin/env python3
 """
-缓存配置管理器 - 优化配置读取性能
-通过缓存机制减少文件I/O操作
+缓存配置管理器 v2 - 支持组(group)概念
+配置格式:
+{
+  "__version": 2,
+  "__active_group": "主力",
+  "__rotation": {"idle_timeout": 300},
+  "__groups": {
+    "主力": {
+      "base_url": "https://example.com/v1",
+      "auth_type": "auth_token",
+      "keys": [
+        {"name": "key1", "auth_token": "sk-xxx", "disabled": false},
+        {"name": "key2", "auth_token": "sk-yyy", "disabled": false}
+      ]
+    }
+  }
+}
 """
 import json
 import time
 import threading
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
 
 class CachedConfigManager:
-    """带缓存的配置管理器"""
-    
+    """带缓存的配置管理器 (v2 组格式)"""
+
     def __init__(self, service_name: str, cache_ttl: float = 5.0):
-        """
-        初始化缓存配置管理器
-        
-        Args:
-            service_name: 服务名称 (claude/codex)
-            cache_ttl: 缓存过期时间（秒），默认5秒
-        """
         self.service_name = service_name
         self.cache_ttl = cache_ttl
         self.config_dir = Path.home() / '.clp'
         self.config_file = self.config_dir / f'{service_name}.json'
-        
-        # 缓存相关
-        self._configs_cache = {}
-        self._active_config_cache = None
-        self._cache_time = 0
-        self._file_mtime = 0
+
+        # 缓存
+        self._groups_cache: Dict[str, Dict[str, Any]] = {}
+        self._active_group_cache: Optional[str] = None
+        self._rotation_cache: Dict[str, Any] = {'idle_timeout': 300}
+        self._cache_time: float = 0
+        self._file_mtime: float = 0
         self._lock = threading.RLock()
 
+    # ── 文件 I/O ──
+
     def _ensure_config_dir(self):
-        """确保配置目录存在"""
         self.config_dir.mkdir(exist_ok=True)
 
     def _ensure_config_file(self) -> bool:
-        """确保配置文件存在，返回是否新创建"""
         self._ensure_config_dir()
         if not self.config_file.exists():
+            empty_v2 = {'__version': 2, '__active_group': None, '__rotation': {'idle_timeout': 300}, '__groups': {}}
             with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump({}, f, ensure_ascii=False, indent=2)
+                json.dump(empty_v2, f, ensure_ascii=False, indent=2)
             return True
         return False
-    
+
     def ensure_config_file(self) -> Path:
-        """对外暴露的确保配置文件存在的方法"""
         self._ensure_config_file()
         return self.config_file
-        
-    def _should_reload(self) -> bool:
-        """
-        检查是否需要重新加载配置
-        基于文件修改时间和缓存TTL判断
-        """
-        try:
-            # 检查文件修改时间
-            current_mtime = self.config_file.stat().st_mtime
-            if current_mtime != self._file_mtime:
-                return True
-                
-            # 检查缓存是否过期
-            if time.time() - self._cache_time > self.cache_ttl:
-                return True
-                
-            return False
-        except (OSError, FileNotFoundError):
-            # 文件不存在或无法访问，需要重新加载
-            return True
-    
-    def _load_configs_from_file(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
-        """从文件加载配置（内部方法）"""
-        created_new = self._ensure_config_file()
-        if created_new:
-            return {}, None
-            
+
+    def _read_json(self) -> Dict[str, Any]:
+        self._ensure_config_file()
         try:
             with open(self.config_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                
-            configs = {}
-            active_config = None
-            
-            # 解析配置格式
-            for config_name, config_data in data.items():
-                if 'base_url' in config_data and 'auth_token' in config_data:
-                    configs[config_name] = {
-                        'base_url': config_data['base_url'],
-                        'auth_token': config_data['auth_token']
-                    }
-                    # 如果存在 api_key，也保留它
-                    if 'api_key' in config_data:
-                        configs[config_name]['api_key'] = config_data['api_key']
-
-                    # 解析权重
-                    weight_value = config_data.get('weight', 0)
-                    try:
-                        weight_value = float(weight_value)
-                    except (TypeError, ValueError):
-                        weight_value = 0
-                    configs[config_name]['weight'] = weight_value
-                    
-                    # 检查是否为激活配置
-                    if config_data.get('active', False):
-                        active_config = config_name
-                        
+            if not isinstance(data, dict):
+                return {}
+            return data
         except (json.JSONDecodeError, OSError) as e:
             print(f"配置文件加载失败: {e}")
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump({}, f, ensure_ascii=False, indent=2)
-            return {}, None
-            
-        # 如果没有激活配置，使用第一个
-        if not active_config and configs:
-            active_config = list(configs.keys())[0]
-            
-        return configs, active_config
-    
+            return {}
+
+    def _write_json(self, data: Dict[str, Any]):
+        self._ensure_config_dir()
+        with open(self.config_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    # ── v1 → v2 迁移 ──
+
+    @staticmethod
+    def _is_v2(data: Dict[str, Any]) -> bool:
+        return data.get('__version') == 2
+
+    @staticmethod
+    def _migrate_v1_to_v2(v1_data: Dict[str, Any]) -> Dict[str, Any]:
+        """将 v1 扁平格式迁移到 v2 组格式"""
+        # 按 base_url 分组
+        url_buckets: Dict[str, List[Tuple[str, Dict]]] = {}
+        active_v1_name: Optional[str] = None
+
+        for name, cfg in v1_data.items():
+            if not isinstance(cfg, dict) or 'base_url' not in cfg:
+                continue
+            url = cfg['base_url']
+            url_buckets.setdefault(url, []).append((name, cfg))
+            if cfg.get('active', False):
+                active_v1_name = name
+
+        # 为每个 URL 生成组名 (用域名)
+        groups: Dict[str, Dict[str, Any]] = {}
+        active_group: Optional[str] = None
+        used_names: Dict[str, int] = {}
+
+        for url, entries in url_buckets.items():
+            # 生成组名
+            parsed = urlparse(url)
+            hostname = parsed.hostname or url
+            if hostname in used_names:
+                used_names[hostname] += 1
+                group_name = f"{hostname}-{used_names[hostname]}"
+            else:
+                used_names[hostname] = 1
+                group_name = hostname
+
+            # 取第一条的 auth_type
+            first_cfg = entries[0][1]
+            auth_type = first_cfg.get('auth_type', 'auth_token')
+            if not auth_type:
+                auth_type = 'api_key' if first_cfg.get('api_key') else 'auth_token'
+
+            keys: List[Dict[str, Any]] = []
+            for name, cfg in entries:
+                key_entry: Dict[str, Any] = {
+                    'name': name,
+                    'auth_token': cfg.get('auth_token', ''),
+                    'disabled': False,
+                }
+                if cfg.get('api_key'):
+                    key_entry['api_key'] = cfg['api_key']
+                if cfg.get('account_id'):
+                    key_entry['account_id'] = cfg['account_id']
+                keys.append(key_entry)
+
+                # 检查是否为活跃配置
+                if name == active_v1_name:
+                    active_group = group_name
+
+            groups[group_name] = {
+                'base_url': url,
+                'auth_type': auth_type,
+                'keys': keys,
+            }
+
+        if not active_group and groups:
+            active_group = next(iter(groups))
+
+        return {
+            '__version': 2,
+            '__active_group': active_group,
+            '__rotation': {'idle_timeout': 300},
+            '__groups': groups,
+        }
+
+    # ── 解析 v2 ──
+
+    @staticmethod
+    def _parse_v2(data: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], Optional[str], Dict[str, Any]]:
+        groups = data.get('__groups', {})
+        active_group = data.get('__active_group')
+        rotation = data.get('__rotation', {'idle_timeout': 300})
+
+        # 确保 active_group 有效
+        if active_group and active_group not in groups:
+            active_group = None
+        if not active_group and groups:
+            active_group = next(iter(groups))
+
+        return groups, active_group, rotation
+
+    # ── 缓存 ──
+
+    def _should_reload(self) -> bool:
+        try:
+            current_mtime = self.config_file.stat().st_mtime
+            if current_mtime != self._file_mtime:
+                return True
+            if time.time() - self._cache_time > self.cache_ttl:
+                return True
+            return False
+        except (OSError, FileNotFoundError):
+            return True
+
     def _refresh_cache(self):
-        """刷新缓存（内部方法）"""
-        configs, active_config = self._load_configs_from_file()
-        self._configs_cache = configs
-        self._active_config_cache = active_config
+        raw = self._read_json()
+
+        if not raw:
+            self._groups_cache = {}
+            self._active_group_cache = None
+            self._rotation_cache = {'idle_timeout': 300}
+        elif self._is_v2(raw):
+            self._groups_cache, self._active_group_cache, self._rotation_cache = self._parse_v2(raw)
+        else:
+            # v1 → v2 迁移
+            v2_data = self._migrate_v1_to_v2(raw)
+            try:
+                self._write_json(v2_data)
+            except OSError as e:
+                print(f"v1→v2 迁移写入失败: {e}")
+            self._groups_cache, self._active_group_cache, self._rotation_cache = self._parse_v2(v2_data)
+
         self._cache_time = time.time()
-        
-        # 更新文件修改时间
         try:
             self._file_mtime = self.config_file.stat().st_mtime
         except (OSError, FileNotFoundError):
             self._file_mtime = 0
-    
-    def _get_cached_data(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
-        """获取缓存的配置数据"""
+
+    def _get_cached(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[str], Dict[str, Any]]:
         with self._lock:
             if self._should_reload():
                 self._refresh_cache()
-            return self._configs_cache.copy(), self._active_config_cache
-    
-    @property
-    def configs(self) -> Dict[str, Dict[str, Any]]:
-        """获取所有配置（使用缓存）"""
-        configs, _ = self._get_cached_data()
-        return configs
-    
-    @property
-    def active_config(self) -> Optional[str]:
-        """获取当前激活的配置名（使用缓存）"""
-        _, active_config = self._get_cached_data()
-        return active_config
-    
-    def set_active_config(self, config_name: str) -> bool:
-        """
-        设置激活配置
-        注意：这会立即写入文件并刷新缓存
-        """
+            return self._groups_cache, self._active_group_cache, self._rotation_cache
+
+    def force_reload(self):
         with self._lock:
-            # 先刷新缓存确保数据最新
             self._refresh_cache()
-            
-            if config_name not in self._configs_cache:
+
+    # ── 组 API (新) ──
+
+    @property
+    def groups(self) -> Dict[str, Dict[str, Any]]:
+        """所有组: {group_name: {base_url, auth_type, keys: [...]}}"""
+        groups, _, _ = self._get_cached()
+        # 返回深拷贝避免外部修改缓存
+        return {k: {**v, 'keys': list(v.get('keys', []))} for k, v in groups.items()}
+
+    @property
+    def active_group(self) -> Optional[str]:
+        """当前激活的组名"""
+        _, ag, _ = self._get_cached()
+        return ag
+
+    @property
+    def rotation_config(self) -> Dict[str, Any]:
+        """轮转配置: {idle_timeout: 300}"""
+        _, _, rot = self._get_cached()
+        return dict(rot)
+
+    def set_active_group(self, group_name: str) -> bool:
+        with self._lock:
+            self._refresh_cache()
+            if group_name not in self._groups_cache:
                 return False
-            
             try:
-                self._save_configs(self._configs_cache, config_name)
-                # 保存成功后立即刷新缓存
+                raw = self._read_json()
+                if not self._is_v2(raw):
+                    raw = self._migrate_v1_to_v2(raw)
+                raw['__active_group'] = group_name
+                self._write_json(raw)
                 self._refresh_cache()
                 return True
             except Exception as e:
-                print(f"保存配置失败: {e}")
+                print(f"设置活跃组失败: {e}")
                 return False
-    
-    def _save_configs(self, configs: Dict[str, Dict[str, Any]], active_config: str):
-        """保存配置到文件"""
-        if not configs:
-            return
-            
-        self._ensure_config_dir()
-        
-        # 构建要保存的数据
-        data = {}
-        for name, config in configs.items():
-            data[name] = {
-                'base_url': config['base_url'],
-                'auth_token': config['auth_token'],
-                'active': name == active_config
-            }
-            # 如果存在 api_key，也保存它
-            if 'api_key' in config:
-                data[name]['api_key'] = config['api_key']
 
-            if 'weight' in config:
-                data[name]['weight'] = config['weight']
-        
-        try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except OSError as e:
-            print(f"保存配置文件失败: {e}")
-            raise
-    
-    def get_active_config_data(self) -> Optional[Dict[str, Any]]:
-        """获取当前激活配置的数据（使用缓存）"""
-        configs, active_config = self._get_cached_data()
-        if not active_config:
+    def get_group_keys(self, group_name: str) -> List[Dict[str, Any]]:
+        """获取指定组的所有 key"""
+        groups, _, _ = self._get_cached()
+        group = groups.get(group_name)
+        if not group:
+            return []
+        return list(group.get('keys', []))
+
+    def get_active_group_data(self) -> Optional[Dict[str, Any]]:
+        """获取当前激活组的完整数据"""
+        groups, ag, _ = self._get_cached()
+        if not ag:
             return None
-        return configs.get(active_config)
-    
-    def force_reload(self):
-        """强制重新加载配置（跳过缓存）"""
+        group = groups.get(ag)
+        if not group:
+            return None
+        return {**group, 'keys': list(group.get('keys', []))}
+
+    # ── 原始数据 API (给 UI 用) ──
+
+    def get_raw_data(self) -> Dict[str, Any]:
+        """获取原始 v2 JSON, 用于 UI 读取"""
         with self._lock:
+            raw = self._read_json()
+            if not self._is_v2(raw):
+                raw = self._migrate_v1_to_v2(raw)
+            return raw
+
+    def save_raw_data(self, data: Dict[str, Any]):
+        """保存原始 v2 JSON, 用于 UI 写入"""
+        with self._lock:
+            self._write_json(data)
             self._refresh_cache()
 
-# 创建全局实例（使用缓存版本）
+    # ── 向后兼容 ──
+
+    @property
+    def configs(self) -> Dict[str, Dict[str, Any]]:
+        """
+        向后兼容: 返回组级字典 {group_name: {base_url, auth_type, keys, ...}}
+        用于 base_proxy 中的负载均衡/路由查找
+        """
+        return self.groups
+
+    @property
+    def active_config(self) -> Optional[str]:
+        """向后兼容: 返回活跃组名"""
+        return self.active_group
+
+    def set_active_config(self, name: str) -> bool:
+        """向后兼容: 设置活跃组"""
+        return self.set_active_group(name)
+
+    def get_active_config_data(self) -> Optional[Dict[str, Any]]:
+        """向后兼容"""
+        return self.get_active_group_data()
+
+
+# 全局实例
 claude_config_manager = CachedConfigManager('claude')
 codex_config_manager = CachedConfigManager('codex')

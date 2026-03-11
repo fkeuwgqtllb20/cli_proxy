@@ -759,16 +759,18 @@ def get_status():
         
         claude_running = claude.is_running()
         claude_pid = claude.get_pid() if claude_running else None
-        claude_config = claude_config_manager.active_config
-        
+        claude_config = claude_config_manager.active_group
+
         codex_running = codex.is_running()
         codex_pid = codex.get_pid() if codex_running else None
-        codex_config = codex_config_manager.active_config
-        
-        # 计算配置数量
-        claude_configs = len(claude_config_manager.configs)
-        codex_configs = len(codex_config_manager.configs)
-        total_configs = claude_configs + codex_configs
+        codex_config = codex_config_manager.active_group
+
+        # 计算配置数量 (按 key 总数)
+        claude_groups = claude_config_manager.groups
+        codex_groups = codex_config_manager.groups
+        claude_key_count = sum(len(g.get('keys', [])) for g in claude_groups.values())
+        codex_key_count = sum(len(g.get('keys', [])) for g in codex_groups.values())
+        total_configs = claude_key_count + codex_key_count
         
         usage_summary, request_count, summary_timestamp = _get_cached_usage_summary()
         
@@ -814,36 +816,27 @@ def get_status():
 
 @app.route('/api/config/<service>', methods=['GET'])
 def get_config(service):
-    """获取配置文件内容"""
+    """获取配置文件内容 (v2 组格式)"""
     try:
         if service not in ['claude', 'codex']:
             return jsonify({'error': 'Invalid service name'}), 400
-        
-        config_file = Path.home() / '.clp' / f'{service}.json'
-        config_file.parent.mkdir(parents=True, exist_ok=True)
 
-        if not config_file.exists():
-            with open(config_file, 'w', encoding='utf-8') as f:
-                json.dump({}, f, ensure_ascii=False, indent=2)
-
-        content = config_file.read_text(encoding='utf-8')
-        if not content.strip():
-            with open(config_file, 'w', encoding='utf-8') as f:
-                json.dump({}, f, ensure_ascii=False, indent=2)
-            content = config_file.read_text(encoding='utf-8')
-
+        from src.config.cached_config_manager import claude_config_manager, codex_config_manager
+        mgr = claude_config_manager if service == 'claude' else codex_config_manager
+        raw = mgr.get_raw_data()
+        content = json.dumps(raw, indent=2, ensure_ascii=False)
         return jsonify({'content': content})
-    
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/config/<service>', methods=['POST'])
 def save_config(service):
-    """保存配置文件内容"""
+    """保存配置文件内容 (v2 组格式)"""
     try:
         if service not in ['claude', 'codex']:
             return jsonify({'error': 'Invalid service name'}), 400
-        
+
         data = request.get_json()
         content = data.get('content', '')
 
@@ -856,38 +849,26 @@ def save_config(service):
         except json.JSONDecodeError as e:
             return jsonify({'error': f'Invalid JSON format: {str(e)}'}), 400
 
-        config_file = Path.home() / '.clp' / f'{service}.json'
-        old_content = None
-        old_configs: Dict[str, Any] = {}
+        from src.config.cached_config_manager import claude_config_manager, codex_config_manager
+        mgr = claude_config_manager if service == 'claude' else codex_config_manager
 
-        if config_file.exists():
-            with open(config_file, 'r', encoding='utf-8') as f:
-                old_content = f.read()
-            try:
-                old_configs = json.loads(old_content)
-            except json.JSONDecodeError:
-                old_configs = {}
-
-        rename_map = _detect_config_renames(old_configs, new_configs)
+        # 获取旧配置用于检测重命名/删除
+        old_raw = mgr.get_raw_data()
+        old_group_names = set(old_raw.get('__groups', {}).keys())
 
         try:
-            # 直接写入新内容
-            with open(config_file, 'w', encoding='utf-8') as f:
-                f.write(content)
-
-            _apply_channel_renames(service, rename_map)
-            _cleanup_deleted_configs(service, old_configs, new_configs)
+            mgr.save_raw_data(new_configs)
         except Exception as exc:
-            # 恢复旧配置，避免部分成功
-            if old_content is not None:
-                with open(config_file, 'w', encoding='utf-8') as f:
-                    f.write(old_content)
-            else:
-                config_file.unlink(missing_ok=True)
             return jsonify({'error': f'配置保存失败: {exc}'}), 500
 
+        # 检测组名变化，清理路由/LB中的旧引用
+        new_group_names = set(new_configs.get('__groups', {}).keys())
+        deleted_groups = old_group_names - new_group_names
+        if deleted_groups:
+            _cleanup_deleted_configs(service, {n: {} for n in old_group_names}, {n: {} for n in new_group_names})
+
         return jsonify({'success': True, 'message': f'{service}配置保存成功'})
-    
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1073,11 +1054,11 @@ def clear_usage():
 
 @app.route('/api/switch-config', methods=['POST'])
 def switch_config():
-    """切换激活配置"""
+    """切换激活组"""
     try:
         data = request.get_json()
         service = data.get('service')
-        config = data.get('config')
+        config = data.get('config')  # 现在是组名
 
         if not service or not config:
             return jsonify({'error': 'Missing service or config parameter'}), 400
@@ -1085,29 +1066,26 @@ def switch_config():
         if service not in ['claude', 'codex']:
             return jsonify({'error': 'Invalid service name'}), 400
 
-        # 导入对应的配置管理器
         if service == 'claude':
             from src.config.cached_config_manager import claude_config_manager as config_manager
         else:
             from src.config.cached_config_manager import codex_config_manager as config_manager
 
-        # 切换配置
-        if config_manager.set_active_config(config):
-            # 验证配置确实已切换
-            actual_config = config_manager.active_config
-            if actual_config == config:
+        if config_manager.set_active_group(config):
+            actual = config_manager.active_group
+            if actual == config:
                 return jsonify({
                     'success': True,
-                    'message': f'{service}配置已切换到: {config}',
-                    'active_config': actual_config
+                    'message': f'{service}已切换到组: {config}',
+                    'active_config': actual
                 })
             else:
                 return jsonify({
                     'success': False,
-                    'message': f'配置切换验证失败，当前配置: {actual_config}'
+                    'message': f'切换验证失败，当前组: {actual}'
                 })
         else:
-            return jsonify({'success': False, 'message': f'配置{config}不存在'})
+            return jsonify({'success': False, 'message': f'组 {config} 不存在'})
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1189,6 +1167,11 @@ def test_connection():
         auth_token = data.get('auth_token')
         api_key = data.get('api_key')
         extra_params = data.get('extra_params', {})
+
+        # OAuth 认证参数透传到 extra_params
+        if data.get('auth_type') == 'oauth':
+            extra_params['auth_type'] = 'oauth'
+            extra_params['account_id'] = data.get('account_id', '')
 
         # 参数验证
         if not service:

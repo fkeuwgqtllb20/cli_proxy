@@ -1353,23 +1353,31 @@ header h1 {
     font-weight: 500;
 }
 
-/* 激活状态的站点卡片 */
-.site-active {
-    border-color: #67c23a;
-    background: #f0f9ff;
+/* 禁用状态的站点卡片 */
+.site-disabled {
+    border-color: #f56c6c;
+    background: #fef0f0;
+    opacity: 0.7;
 }
 
-.site-active::before {
-    content: "已激活";
+.site-disabled::before {
+    content: "已禁用";
     position: absolute;
     top: -12px;
     right: 16px;
-    background: #67c23a;
+    background: #f56c6c;
     color: white;
     padding: 4px 12px;
     border-radius: 4px;
     font-size: 12px;
     font-weight: 500;
+}
+
+/* 只读字段显示 */
+.field-readonly {
+    color: #606266;
+    font-size: 14px;
+    line-height: 32px;
 }
 
 /* 配置字段布局 */
@@ -1471,7 +1479,7 @@ header h1 {
     }
 
     .new-site-editor::before,
-    .site-active::before {
+    .site-disabled::before {
         position: static;
         display: inline-block;
         margin-bottom: 12px;
@@ -2246,8 +2254,9 @@ header h1 {
 }
 
 .merged-group-header .group-field label {
-    font-weight: 500;
-    color: #606266;
+    font-size: 12px;
+    font-weight: 400;
+    color: #909399;
     white-space: nowrap;
 }
 

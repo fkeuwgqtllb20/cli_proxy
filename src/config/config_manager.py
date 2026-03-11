@@ -62,7 +62,12 @@ class ConfigManager:
                     except (TypeError, ValueError):
                         weight_value = 0
                     configs[config_name]['weight'] = weight_value
-                    
+
+                    # 保留 OAuth 等扩展字段
+                    for extra_key in ('account_id', 'auth_type'):
+                        if extra_key in config_data:
+                            configs[config_name][extra_key] = config_data[extra_key]
+
                     # 检查是否为激活配置
                     if config_data.get('active', False):
                         active_config = config_name
@@ -127,6 +132,11 @@ class ConfigManager:
             # 如果存在权重，也保存
             if 'weight' in config:
                 data[name]['weight'] = config['weight']
+
+            # 保留 OAuth 等扩展字段
+            for extra_key in ('account_id', 'auth_type'):
+                if extra_key in config:
+                    data[name][extra_key] = config[extra_key]
         
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:

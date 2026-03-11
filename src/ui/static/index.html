@@ -44,10 +44,10 @@
                                         size="small"
                                         style="width: 150px;"
                                         :disabled="isLoadbalanceWeightMode">
-                                        <el-option 
-                                            v-for="config in claudeConfigs" 
-                                            :key="config" 
-                                            :label="config" 
+                                        <el-option
+                                            v-for="config in claudeConfigs"
+                                            :key="config"
+                                            :label="`${config} (${configMetadata.claude[config]?.keyCount || 0}个key)`"
                                             :value="config">
                                         </el-option>
                                     </el-select>
@@ -76,10 +76,10 @@
                                         size="small"
                                         style="width: 150px;"
                                         :disabled="isLoadbalanceWeightMode">
-                                        <el-option 
-                                            v-for="config in codexConfigs" 
-                                            :key="config" 
-                                            :label="config" 
+                                        <el-option
+                                            v-for="config in codexConfigs"
+                                            :key="config"
+                                            :label="`${config} (${configMetadata.codex[config]?.keyCount || 0}个key)`"
                                             :value="config">
                                         </el-option>
                                     </el-select>
@@ -356,18 +356,19 @@
                             <div class="merged-groups-container">
                                 <div
                                     v-for="(group, groupIndex) in mergedConfigs.claude"
-                                    :key="group.baseUrl"
+                                    :key="group.groupName"
                                     :class="['merged-group-card', { 'merged-group-active': isMergedGroupActive(group) }]">
 
-                                    <!-- 站点名称 -->
+                                    <!-- 组名 + 秘钥名称 -->
                                     <div class="merged-group-names">
+                                        <el-tag type="primary" size="small" effect="dark" style="margin-right: 8px;">{{ group.groupName }}</el-tag>
                                         <el-tag
                                             v-for="entry in group.entries"
                                             :key="entry.siteId"
-                                            :type="entry.active ? 'success' : 'info'"
+                                            :type="entry.disabled ? 'danger' : 'info'"
                                             size="small"
                                             class="merged-name-tag">
-                                            {{ entry.name }}
+                                            {{ entry.name }}{{ entry.disabled ? ' (禁用)' : '' }}
                                         </el-tag>
                                     </div>
 
@@ -381,17 +382,6 @@
                                                 @blur="applyMergedGroupUpdate('claude', groupIndex)"
                                                 style="width: 350px;">
                                             </el-input>
-                                        </div>
-
-                                        <div class="group-field">
-                                            <label>权重:</label>
-                                            <el-input-number
-                                                v-model="group.weight"
-                                                :min="0"
-                                                :step="1"
-                                                @change="applyMergedGroupUpdate('claude', groupIndex)"
-                                                style="width: 120px;">
-                                            </el-input-number>
                                         </div>
 
                                         <div class="group-field">
@@ -478,14 +468,6 @@
                                         </el-input>
                                     </div>
                                     <div class="config-field">
-                                        <label class="field-label">权重:</label>
-                                        <el-input-number
-                                            v-model.number="newSiteData.claude.weight"
-                                            :min="0"
-                                            :step="1">
-                                        </el-input-number>
-                                    </div>
-                                    <div class="config-field">
                                         <label class="field-label">认证方式:</label>
                                         <el-radio-group v-model="newSiteData.claude.authType">
                                             <el-radio-button label="auth_token">Auth Token</el-radio-button>
@@ -515,42 +497,27 @@
                                 </div>
 
                                 <!-- 现有站点列表 -->
-                                <div v-for="(site, index) in friendlyConfigs.claude" :key="index"
-                                     :class="['config-site-card', { 'site-active': site.active }]">
+                                <div v-for="(site, index) in friendlyConfigs.claude" :key="ensureEntryId(site)"
+                                     :class="['config-site-card', { 'site-disabled': site.disabled }]">
                                     <div class="config-field">
-                                        <label class="field-label">站点名称:</label>
+                                        <label class="field-label">所属组:</label>
+                                        <span class="field-readonly">{{ site.groupName || '-' }}</span>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">Key 名称:</label>
                                         <el-input
                                             v-model="site.name"
-                                            placeholder="站点名称"
+                                            placeholder="Key名称"
                                             @input="syncFormToJson('claude')">
                                         </el-input>
                                     </div>
                                     <div class="config-field">
                                         <label class="field-label">目标地址:</label>
-                                        <el-input
-                                            v-model="site.baseUrl"
-                                            placeholder="目标站点地址"
-                                            @input="syncFormToJson('claude')">
-                                        </el-input>
-                                    </div>
-                                    <div class="config-field">
-                                        <label class="field-label">权重:</label>
-                                        <el-input-number
-                                            v-model.number="site.weight"
-                                            :min="0"
-                                            :step="1"
-                                            @change="syncFormToJson('claude')"
-                                            @input="syncFormToJson('claude')">
-                                        </el-input-number>
+                                        <span class="field-readonly">{{ site.baseUrl || '-' }}</span>
                                     </div>
                                     <div class="config-field">
                                         <label class="field-label">认证方式:</label>
-                                        <el-radio-group
-                                            v-model="site.authType"
-                                            @change="syncFormToJson('claude')">
-                                            <el-radio-button label="auth_token">Auth Token</el-radio-button>
-                                            <el-radio-button label="api_key">API Key</el-radio-button>
-                                        </el-radio-group>
+                                        <span class="field-readonly">{{ site.authType === 'oauth' ? 'OAuth' : site.authType === 'api_key' ? 'API Key' : 'Auth Token' }}</span>
                                     </div>
                                     <div class="config-field">
                                         <label class="field-label">认证密钥:</label>
@@ -563,11 +530,11 @@
                                         </el-input>
                                     </div>
                                     <div class="config-field">
-                                        <label class="field-label">激活状态:</label>
+                                        <label class="field-label">禁用:</label>
                                         <div class="field-control">
                                             <el-switch
-                                                v-model="site.active"
-                                                @change="handleActiveChange('claude', index, $event)">
+                                                v-model="site.disabled"
+                                                @change="syncFormToJson('claude')">
                                             </el-switch>
                                             <div class="config-actions-inline">
                                                 <el-button
@@ -680,18 +647,19 @@
                             <div class="merged-groups-container">
                                 <div
                                     v-for="(group, groupIndex) in mergedConfigs.codex"
-                                    :key="group.baseUrl"
+                                    :key="group.groupName"
                                     :class="['merged-group-card', { 'merged-group-active': isMergedGroupActive(group) }]">
 
-                                    <!-- 站点名称 -->
+                                    <!-- 组名 + 秘钥名称 -->
                                     <div class="merged-group-names">
+                                        <el-tag type="primary" size="small" effect="dark" style="margin-right: 8px;">{{ group.groupName }}</el-tag>
                                         <el-tag
                                             v-for="entry in group.entries"
                                             :key="entry.siteId"
-                                            :type="entry.active ? 'success' : 'info'"
+                                            :type="entry.disabled ? 'danger' : 'info'"
                                             size="small"
                                             class="merged-name-tag">
-                                            {{ entry.name }}
+                                            {{ entry.name }}{{ entry.disabled ? ' (禁用)' : '' }}
                                         </el-tag>
                                     </div>
 
@@ -708,17 +676,6 @@
                                         </div>
 
                                         <div class="group-field">
-                                            <label>权重:</label>
-                                            <el-input-number
-                                                v-model="group.weight"
-                                                :min="0"
-                                                :step="1"
-                                                @change="applyMergedGroupUpdate('codex', groupIndex)"
-                                                style="width: 120px;">
-                                            </el-input-number>
-                                        </div>
-
-                                        <div class="group-field">
                                             <label>认证方式:</label>
                                             <el-radio-group
                                                 v-model="group.authType"
@@ -726,6 +683,7 @@
                                                 size="small">
                                                 <el-radio-button label="auth_token">Auth Token</el-radio-button>
                                                 <el-radio-button label="api_key">API Key</el-radio-button>
+                                                <el-radio-button label="oauth">OAuth</el-radio-button>
                                             </el-radio-group>
                                         </div>
                                     </div>
@@ -802,18 +760,11 @@
                                         </el-input>
                                     </div>
                                     <div class="config-field">
-                                        <label class="field-label">权重:</label>
-                                        <el-input-number
-                                            v-model.number="newSiteData.codex.weight"
-                                            :min="0"
-                                            :step="1">
-                                        </el-input-number>
-                                    </div>
-                                    <div class="config-field">
                                         <label class="field-label">认证方式:</label>
                                         <el-radio-group v-model="newSiteData.codex.authType">
                                             <el-radio-button label="auth_token">Auth Token</el-radio-button>
                                             <el-radio-button label="api_key">API Key</el-radio-button>
+                                            <el-radio-button label="oauth">OAuth</el-radio-button>
                                         </el-radio-group>
                                     </div>
                                     <div class="config-field">
@@ -839,42 +790,27 @@
                                 </div>
 
                                 <!-- 现有站点列表 -->
-                                <div v-for="(site, index) in friendlyConfigs.codex" :key="index"
-                                     :class="['config-site-card', { 'site-active': site.active }]">
+                                <div v-for="(site, index) in friendlyConfigs.codex" :key="ensureEntryId(site)"
+                                     :class="['config-site-card', { 'site-disabled': site.disabled }]">
                                     <div class="config-field">
-                                        <label class="field-label">站点名称:</label>
+                                        <label class="field-label">所属组:</label>
+                                        <span class="field-readonly">{{ site.groupName || '-' }}</span>
+                                    </div>
+                                    <div class="config-field">
+                                        <label class="field-label">Key 名称:</label>
                                         <el-input
                                             v-model="site.name"
-                                            placeholder="站点名称"
+                                            placeholder="Key名称"
                                             @input="syncFormToJson('codex')">
                                         </el-input>
                                     </div>
                                     <div class="config-field">
                                         <label class="field-label">目标地址:</label>
-                                        <el-input
-                                            v-model="site.baseUrl"
-                                            placeholder="目标站点地址"
-                                            @input="syncFormToJson('codex')">
-                                        </el-input>
-                                    </div>
-                                    <div class="config-field">
-                                        <label class="field-label">权重:</label>
-                                        <el-input-number
-                                            v-model.number="site.weight"
-                                            :min="0"
-                                            :step="1"
-                                            @change="syncFormToJson('codex')"
-                                            @input="syncFormToJson('codex')">
-                                        </el-input-number>
+                                        <span class="field-readonly">{{ site.baseUrl || '-' }}</span>
                                     </div>
                                     <div class="config-field">
                                         <label class="field-label">认证方式:</label>
-                                        <el-radio-group
-                                            v-model="site.authType"
-                                            @change="syncFormToJson('codex')">
-                                            <el-radio-button label="auth_token">Auth Token</el-radio-button>
-                                            <el-radio-button label="api_key">API Key</el-radio-button>
-                                        </el-radio-group>
+                                        <span class="field-readonly">{{ site.authType === 'oauth' ? 'OAuth' : site.authType === 'api_key' ? 'API Key' : 'Auth Token' }}</span>
                                     </div>
                                     <div class="config-field">
                                         <label class="field-label">认证密钥:</label>
@@ -887,11 +823,11 @@
                                         </el-input>
                                     </div>
                                     <div class="config-field">
-                                        <label class="field-label">激活状态:</label>
+                                        <label class="field-label">禁用:</label>
                                         <div class="field-control">
                                             <el-switch
-                                                v-model="site.active"
-                                                @change="handleActiveChange('codex', index, $event)">
+                                                v-model="site.disabled"
+                                                @change="syncFormToJson('codex')">
                                             </el-switch>
                                             <div class="config-actions-inline">
                                                 <el-button
@@ -1452,6 +1388,35 @@
                             <el-option label="minimal" value="minimal"></el-option>
                         </el-select>
                     </el-form-item>
+                    <el-form-item label="管理列表:">
+                        <div style="width: 100%">
+                            <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; min-height: 24px;">
+                                <el-tag
+                                    v-for="m in (systemConfig.testModels[testConfig.service] || [])"
+                                    :key="m"
+                                    closable
+                                    size="small"
+                                    @close="removeTestModel(testConfig.service, m)">
+                                    {{ m }}
+                                </el-tag>
+                                <span v-if="!(systemConfig.testModels[testConfig.service] || []).length"
+                                      style="color: #999; font-size: 12px; line-height: 24px;">
+                                    暂无预设，可直接在上方输入模型名
+                                </span>
+                            </div>
+                            <div style="display: flex; gap: 8px;">
+                                <el-input
+                                    v-model="newTestModelInput[testConfig.service]"
+                                    placeholder="输入模型ID后点击添加"
+                                    size="small"
+                                    @keyup.enter="addTestModel(testConfig.service)"
+                                    style="flex: 1">
+                                </el-input>
+                                <el-button size="small" @click="addTestModel(testConfig.service)">添加</el-button>
+                                <el-button size="small" type="primary" @click="saveTestModels(testConfig.service)">保存</el-button>
+                            </div>
+                        </div>
+                    </el-form-item>
                 </el-form>
 
                 <!-- 测试结果显示区域 -->
@@ -1952,6 +1917,14 @@
                 :model="mergedDialogDraft"
                 :label-width="isMobileViewport ? 'auto' : '100px'"
                 :label-position="isMobileViewport ? 'top' : 'right'">
+                <el-form-item label="组名:" required>
+                    <el-input
+                        v-model="mergedDialogDraft.groupName"
+                        placeholder="例如: 主力组"
+                        :disabled="false">
+                    </el-input>
+                </el-form-item>
+
                 <el-form-item label="目标地址:" required>
                     <el-input
                         v-model="mergedDialogDraft.baseUrl"
@@ -1959,18 +1932,11 @@
                     </el-input>
                 </el-form-item>
 
-                <el-form-item label="权重:">
-                    <el-input-number
-                        v-model="mergedDialogDraft.weight"
-                        :min="0"
-                        :step="1">
-                    </el-input-number>
-                </el-form-item>
-
                 <el-form-item label="认证方式:">
                     <el-radio-group v-model="mergedDialogDraft.authType">
                         <el-radio-button label="auth_token">Auth Token</el-radio-button>
                         <el-radio-button label="api_key">API Key</el-radio-button>
+                        <el-radio-button v-if="mergedDialogService === 'codex'" label="oauth">OAuth</el-radio-button>
                     </el-radio-group>
                 </el-form-item>
 
@@ -1982,16 +1948,26 @@
                         <el-input
                             v-model="entry.name"
                             placeholder="站点名称"
-                            :style="isMobileViewport ? {} : { width: '180px' }">
+                            :style="isMobileViewport ? {} : { width: '150px' }">
                         </el-input>
                         <el-input
                             v-model="entry.authValue"
-                            placeholder="秘钥"
+                            :placeholder="mergedDialogDraft.authType === 'oauth' ? 'Access Token' : '秘钥'"
                             type="password"
                             show-password
-                            :style="isMobileViewport ? {} : { width: '280px' }">
+                            :style="isMobileViewport ? {} : { width: mergedDialogDraft.authType === 'oauth' ? '200px' : '280px' }">
                         </el-input>
-                        <el-switch v-model="entry.active"></el-switch>
+                        <el-input
+                            v-if="mergedDialogDraft.authType === 'oauth'"
+                            v-model="entry.accountId"
+                            placeholder="Account ID"
+                            :style="isMobileViewport ? {} : { width: '200px' }">
+                        </el-input>
+                        <el-switch
+                            v-model="entry.disabled"
+                            active-text="禁用"
+                            style="margin-right: 4px;">
+                        </el-switch>
                         <el-button
                             type="danger"
                             size="small"

@@ -81,8 +81,14 @@ class CodexProxy(BaseProxyService):
                 "openai-beta": "responses=experimental",
                 "originator": "codex_cli_rs",
                 "session_id": session_uuid,
-                "user-agent": "codex_cli_rs/0.42.0 (Mac OS 26.0.0; arm64) Apple_Terminal/464"
+                "user-agent": "codex_cli_rs/0.101.0 (Mac OS 26.0.0; arm64) Apple_Terminal/464"
             }
+
+            # OAuth 认证：注入 account_id
+            if extra_params and extra_params.get('auth_type') == 'oauth':
+                account_id = extra_params.get('account_id', '')
+                if account_id:
+                    headers['chatgpt-account-id'] = account_id
 
             # 构建基础OpenAI API请求
             openai_body = {
