@@ -255,6 +255,31 @@ class CachedConfigManager:
                 print(f"设置活跃组失败: {e}")
                 return False
 
+    def disable_key(self, group_name: str, key_name: str, reason: str = '') -> bool:
+        """将指定组中的 key 标记为 disabled，持久化到配置文件"""
+        with self._lock:
+            try:
+                raw = self._read_json()
+                if not self._is_v2(raw):
+                    raw = self._migrate_v1_to_v2(raw)
+                groups = raw.get('__groups', {})
+                group = groups.get(group_name)
+                if not group:
+                    return False
+                for key in group.get('keys', []):
+                    if key.get('name') == key_name:
+                        key['disabled'] = True
+                        if reason:
+                            key['reason'] = reason
+                        self._write_json(raw)
+                        self._refresh_cache()
+                        print(f"[KEY禁用] 组={group_name} key={key_name} 原因={reason}")
+                        return True
+                return False
+            except Exception as e:
+                print(f"禁用 key 失败: {e}")
+                return False
+
     def get_group_keys(self, group_name: str) -> List[Dict[str, Any]]:
         """获取指定组的所有 key"""
         groups, _, _ = self._get_cached()

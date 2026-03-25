@@ -87,6 +87,9 @@ class BaseProxyService(ABC):
         # {group_name: {'index': int, 'last_time': float}}
         self._rotation_state: Dict[str, Dict[str, Any]] = {}
 
+        # 触发自动禁用 key 的 HTTP 状态码
+        self.KEY_FATAL_STATUS_CODES = {401, 402, 403, 429}
+
         # 初始化实时事件中心
         self.realtime_hub = RealTimeRequestHub(service_name)
 
@@ -778,13 +781,14 @@ class BaseProxyService(ABC):
         if changed:
             self._persist_lb_config()
 
-    def _select_key_from_group(self, group_name: str, group_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _select_key_from_group(self, group_name: str, group_data: Dict[str, Any], exclude_keys: set = None) -> Optional[Dict[str, Any]]:
         """
         从组中选择一个 key，基于空闲超时轮转策略:
         - 距上次请求未超过 idle_timeout → 继续使用当前 key (保住缓存)
         - 超过 idle_timeout → 轮转到下一个 key
         """
-        keys = [k for k in group_data.get('keys', []) if not k.get('disabled', False)]
+        keys = [k for k in group_data.get('keys', [])
+                if not k.get('disabled', False) and k.get('name') not in (exclude_keys or set())]
         if not keys:
             return None
         if len(keys) == 1:
@@ -810,12 +814,12 @@ class BaseProxyService(ABC):
             index = state['index'] % len(keys)
             return keys[index]
 
-    def build_target_param(self, path: str, request: Request, body: bytes) -> Tuple[str, Dict, bytes, Optional[str]]:
+    def build_target_param(self, path: str, request: Request, body: bytes, exclude_keys: set = None) -> Tuple[str, Dict, bytes, Optional[str], Optional[str]]:
         """
         构建请求参数 (v2 组格式)
 
         Returns:
-            (target_url, headers, body, key_name_for_logging)
+            (target_url, headers, body, key_name_for_logging, group_name)
         """
         # 使用最新的路由配置
         self._ensure_routing_config_current()
@@ -847,7 +851,7 @@ class BaseProxyService(ABC):
                 raise ValueError(f"未找到任何可用配置组")
 
         # 从组中选择一个 key (轮转)
-        key_data = self._select_key_from_group(group_name, group_data)
+        key_data = self._select_key_from_group(group_name, group_data, exclude_keys)
         if not key_data:
             raise ValueError(f"组 {group_name} 中没有可用的 key")
 
@@ -880,7 +884,7 @@ class BaseProxyService(ABC):
             if key_data.get('account_id'):
                 headers['chatgpt-account-id'] = key_data['account_id']
 
-        return target_url, headers, modified_body, key_name
+        return target_url, headers, modified_body, key_name, group_name
 
     @abstractmethod
     def test_endpoint(self, model: str, base_url: str, auth_token: str = None, api_key: str = None, extra_params: dict = None) -> dict:
@@ -917,12 +921,13 @@ class BaseProxyService(ABC):
         original_body = await request.body()
 
         active_config_name: Optional[str] = None
+        active_group_name: Optional[str] = None
         target_headers: Optional[Dict[str, str]] = None
         filtered_body: Optional[bytes] = None
         target_url: Optional[str] = None
 
         try:
-            target_url, target_headers, target_body, active_config_name = self.build_target_param(path, request, original_body)
+            target_url, target_headers, target_body, active_config_name, active_group_name = self.build_target_param(path, request, original_body)
 
             # 发送请求开始事件
             await self.realtime_hub.request_started(
@@ -957,13 +962,71 @@ class BaseProxyService(ABC):
         )
 
         try:
-            request_out = self.client.build_request(
-                method=request.method,
-                url=target_url,
-                headers=target_headers,
-                content=filtered_body if filtered_body else None,
-            )
-            response = await self.client.send(request_out, stream=is_stream)
+            # Key 错误感知重试: 遇到 401/402/403/429 时禁用当前 key 并尝试下一个
+            excluded_keys: set = set()
+            response = None
+
+            while True:
+                request_out = self.client.build_request(
+                    method=request.method,
+                    url=target_url,
+                    headers=target_headers,
+                    content=filtered_body if filtered_body else None,
+                )
+                response = await self.client.send(request_out, stream=is_stream)
+                status_code = response.status_code
+
+                if status_code not in self.KEY_FATAL_STATUS_CODES:
+                    break  # 正常响应或非 key 级别的错误，不重试
+
+                # 读取错误响应体用于日志
+                error_body = None
+                if is_stream:
+                    error_body = b''
+                    async for chunk in response.aiter_bytes():
+                        error_body += chunk
+                    await response.aclose()
+                else:
+                    error_body = response.content
+
+                # 禁用当前 key
+                excluded_keys.add(active_config_name)
+                reason = f"HTTP {status_code}"
+                try:
+                    error_text = error_body.decode('utf-8', errors='ignore')[:200] if error_body else ''
+                    if error_text:
+                        reason = f"HTTP {status_code}: {error_text}"
+                except Exception:
+                    pass
+                await asyncio.to_thread(
+                    self.config_manager.disable_key, active_group_name, active_config_name, reason
+                )
+                await asyncio.to_thread(self._record_lb_result, active_config_name, status_code)
+
+                # 尝试选下一个 key
+                try:
+                    target_url, target_headers, target_body, active_config_name, active_group_name = \
+                        self.build_target_param(path, request, original_body, exclude_keys=excluded_keys)
+                    filtered_body = await asyncio.to_thread(self.apply_request_filter, target_body)
+                    print(f"[KEY重试] 切换到 key={active_config_name}，已排除: {excluded_keys}")
+                except ValueError:
+                    # 没有更多可用 key，返回最后一次的错误响应
+                    duration_ms = int((time.time() - start_time) * 1000)
+                    await self.realtime_hub.request_completed(
+                        request_id=request_id, status_code=status_code,
+                        duration_ms=duration_ms, success=False
+                    )
+                    await self.log_request(
+                        method=request.method, path=path, status_code=status_code,
+                        duration_ms=duration_ms, target_headers=target_headers,
+                        filtered_body=filtered_body, original_headers=original_headers,
+                        original_body=original_body, response_content=error_body,
+                        channel=active_config_name, target_url=target_url,
+                    )
+                    return JSONResponse(
+                        {"type": "error", "error": {"type": "api_error", "message": f"组内所有 key 均不可用 (最后错误: HTTP {status_code})"}},
+                        status_code=status_code
+                    )
 
             status_code = response.status_code
             lb_result_recorded = False
