@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 import ssl
 import certifi
 import httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -93,10 +94,14 @@ class BaseProxyService(ABC):
         # 初始化实时事件中心
         self.realtime_hub = RealTimeRequestHub(service_name)
 
-        # 初始化FastAPI应用
-        self.app = FastAPI()
+        # 初始化FastAPI应用（使用 lifespan 管理生命周期）
+        @asynccontextmanager
+        async def lifespan(app):
+            yield
+            await self.client.aclose()
+
+        self.app = FastAPI(lifespan=lifespan)
         self._setup_routes()
-        self.app.add_event_handler("shutdown", self._shutdown_event)
 
         # 导入过滤器
         try:
@@ -133,10 +138,6 @@ class BaseProxyService(ABC):
         )
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         return httpx.AsyncClient(timeout=timeout, limits=limits, headers={"Connection": "keep-alive"}, verify=ssl_context)
-
-    async def _shutdown_event(self):
-        """FastAPI 关闭事件，释放HTTP客户端资源"""
-        await self.client.aclose()
 
     def _setup_routes(self):
         """设置API路由"""
